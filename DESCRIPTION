@@ -1,0 +1,16 @@
+Package: repboxReportSummary
+Type: Package
+Title: Summary reports of Stata reproduction across multiple projects
+Version: 0.1.0
+Authors@R: c(
+    person(
+      "Sebastian", "Kranz",
+      email = "sebastian.kranz@uni-ulm.de",
+      role = c("aut", "cre")
+    )
+  )
+Description: Summary reports of Stata reproduction across multiple projects
+Depends: repboxDB, repboxUtils, stringi, htmltools
+License: GPL 3.0
+Encoding: UTF-8
+LazyData: true
