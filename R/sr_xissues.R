@@ -12,6 +12,72 @@ sr_xissue_pane_ui = function() {
   )
 }
 
+# Map issue category strings consistently to short failure categories
+sr_issue_to_failure_cat = function(cat) {
+  restore.point("sr_issue_to_failure_cat")
+  if (is.null(cat) || length(cat) == 0) return(character(0))
+  cat[is.na(cat)] = ""
+
+  failure_cat = rep("", length(cat))
+  failure_cat[grepl("sb_raw, sb and rb failed", cat)] = "sb_raw-sb-rb"
+  failure_cat[grepl("sb and rb failed", cat) & failure_cat == ""] = "sb-rb"
+  failure_cat[grepl("rb failed", cat) & failure_cat == ""] = "rb"
+  failure_cat[grepl("coefs don't match|coeffs don't match", cat, ignore.case = TRUE) & failure_cat == ""] = "coefs"
+  failure_cat[grepl("sb and so coefs", cat) & failure_cat == ""] = "so"
+
+  failure_cat
+}
+
+# Match issues dataframe against known xissues dataframe
+sr_match_xissues = function(df_issues, xi_df) {
+  restore.point("sr_match_xissues")
+  res_xid = rep("", nrow(df_issues))
+  if (NROW(xi_df) == 0 || NROW(df_issues) == 0) return(res_xid)
+
+  df_fail_cat = sr_issue_to_failure_cat(df_issues$issue_category)
+
+  df_cmd = stringi::stri_trim_both(as.character(df_issues$cmd))
+  df_cmd[is.na(df_cmd)] = ""
+
+  df_cmdline = as.character(df_issues$cmdline)
+  df_cmdline[is.na(df_cmdline)] = ""
+
+  for (i in seq_len(nrow(xi_df))) {
+    xi = xi_df[i, ]
+    if (is.null(xi$xid) || is.na(xi$xid) || !nzchar(xi$xid)) next
+
+    # 1. Failure mode match
+    match_mask = (df_fail_cat == xi$failure_cat)
+
+    # 2. Cmd match (if specified)
+    if (!is.null(xi$cmd) && nzchar(xi$cmd)) {
+      xi_cmds = stringi::stri_split_fixed(xi$cmd, ",")[[1]]
+      xi_cmds = stringi::stri_trim_both(xi_cmds)
+      xi_cmds = xi_cmds[nzchar(xi_cmds)]
+      if (length(xi_cmds) > 0) {
+        match_mask = match_mask & (df_cmd %in% xi_cmds)
+      }
+    }
+
+    # 3. Fixed pattern match (if specified)
+    if (!is.null(xi$fixed_pattern) && nzchar(xi$fixed_pattern)) {
+      rx = fixed_terms_to_regex(xi$fixed_pattern, space_to_ws = TRUE)
+      match_mask = match_mask & stringi::stri_detect_regex(df_cmdline, rx)
+    }
+
+    # 4. Regex pattern match (if specified)
+    if (!is.null(xi$rx_pattern) && nzchar(xi$rx_pattern)) {
+      match_mask = match_mask & stringi::stri_detect_regex(df_cmdline, xi$rx_pattern)
+    }
+
+    # Update matches that have not been assigned an xid yet (first match wins)
+    update_idx = match_mask & (res_xid == "")
+    res_xid[update_idx] = xi$xid
+  }
+
+  res_xid
+}
+
 # Create a YAML template from an issue
 sr_make_xissue_template = function(issue, project) {
   cmd = if (!is.null(issue$cmd)) issue$cmd else ""
@@ -27,17 +93,13 @@ sr_make_xissue_template = function(issue, project) {
   if (is.null(cat)) cat = ""
   if (is.na(cat)) cat = ""
 
-  failure_cat = ""
-  if (grepl("sb_raw, sb and rb failed", cat)) failure_cat = "sb_raw-sb-rb"
-  else if (grepl("sb and rb failed", cat)) failure_cat = "sb-rb"
-  else if (grepl("rb failed", cat)) failure_cat = "rb"
-  else if (grepl("coefs don't match|coeffs don't match", cat, ignore.case = TRUE)) failure_cat = "coefs"
-  else if (grepl("sb and so coefs", cat)) failure_cat = "so"
+  failure_cat = sr_issue_to_failure_cat(cat)
 
   artid = project
   if (is.null(artid)) artid = ""
 
   li = list(
+    xid = "",
     where = "reg",
     cmd = as.character(cmd),
     fixed_pattern = "",

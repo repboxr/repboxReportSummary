@@ -4,6 +4,7 @@
 #' @return A data.frame of all issues combined and categorized.
 #' @export
 sr_aggregate_issues = function(project_dirs) {
+  restore.point("sr_aggregrate_issues")
   dfs = lapply(project_dirs, sr_get_project_issues)
   dfs = dfs[!vapply(dfs, is.null, logical(1))]
 
@@ -22,6 +23,8 @@ sr_aggregate_issues = function(project_dirs) {
 #' @return A data.frame of all problems combined.
 #' @export
 sr_aggregate_problems = function(project_dirs) {
+  restore.point("sr_aggregate_problems")
+
   dfs = lapply(project_dirs, sr_get_project_problems)
   dfs = dfs[!vapply(dfs, is.null, logical(1))]
 
@@ -35,16 +38,17 @@ sr_aggregate_problems = function(project_dirs) {
 }
 
 #' Get and categorize issues for a single project based on fine-tuned categories
-sr_get_project_issues = function(project_dir) {
+sr_get_project_issues = function(project_dir, parcels=list()) {
   restore.point("sr_get_project_issues")
-  regcheck = sr_read_parcel(project_dir, "regcheck")
+  library(repboxDB)
+
+  parcels = repdb_load_parcels(project_dir,c("regcheck", "reg"))
+  regcheck = parcels$regcheck
+  reg = parcels$reg
   if (is.null(regcheck) || NROW(regcheck) == 0) return(NULL)
-
   df_rc = as.data.frame(regcheck)
-
-  if (!"cmd" %in% names(df_rc)) {
-    df_rc$cmd = NA_character_
-  }
+  df_rc = left_join(df_rc, reg %>% select(runid, cmd, cmdline), by="runid") %>%
+    mutate(line=NA, file_path=NA)
 
   # Check if run worked
   reg_ok = sr_v_bool(df_rc$reg_ok, FALSE)
@@ -90,7 +94,9 @@ sr_get_project_issues = function(project_dir) {
   cat[mask1] = "1. sb_raw, sb and rb failed but so exists"
 
   df_rc$issue_category = cat
-  df_rc$project = basename(project_dir)
+  if (!"artid" %in% names(df_rc)) {
+    df_rc$artid = basename(project_dir)
+  }
   df_rc$project_dir = project_dir
 
   # Filter only actual issues
@@ -99,35 +105,26 @@ sr_get_project_issues = function(project_dir) {
 
   if (NROW(df_rc) == 0) return(NULL)
 
-  # Try to merge command line info from run_cmd if available for display
-  run_cmd = sr_read_parcel(project_dir, "stata_run_cmd")
-  if (!is.null(run_cmd) && "runid" %in% names(run_cmd)) {
-    rcmd = as.data.frame(run_cmd)
-    keep_rcmd = intersect(names(rcmd), c("runid", "cmdline", "file_path", "line"))
-    rcmd = rcmd[, keep_rcmd, drop = FALSE]
-
-    if (NROW(rcmd) > 0) {
-      df_rc = merge(df_rc, rcmd, by = "runid", all.x = TRUE, suffixes=c("", ".y"))
-      # Remove redundant merge columns
-      for (col in names(df_rc)) {
-        if (endsWith(col, ".y")) df_rc[[col]] = NULL
-      }
-    }
-  }
-
-  if (!"cmdline" %in% names(df_rc)) df_rc$cmdline = NA_character_
-
   df_rc
 }
 
 #' Get repbox_problems for a single project
 sr_get_project_problems = function(project_dir) {
-  probs = sr_read_parcel(project_dir, "repbox_problem")
+  restore.point("sr_get_project_problems")
+  if (!repdb_has_parcel(project_dir, "problem")) {
+    repboxRun::repbox_store_project_problems(project_dir = project_dir)
+  }
+  probs = repdb_load_parcels(project_dir, "problem")$problem
   if (is.null(probs) || NROW(probs) == 0) return(NULL)
 
   df_prob = as.data.frame(probs)
-  df_prob$project = basename(project_dir)
+  if (!"artid" %in% names(df_prob)) {
+    df_prob$artid = basename(project_dir)
+  }
   df_prob$project_dir = project_dir
 
+  # ignore some problems that are unimportant
+
+  df_prob = dplyr::filter(df_prob, !stringi::stri_detect_fixed(df_prob$problem_type,"_journ_"))
   df_prob
 }

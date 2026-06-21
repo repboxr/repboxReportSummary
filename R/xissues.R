@@ -37,13 +37,30 @@ xissue_make = function(xid="", where = c("reg", "mod")[1], cmd="", fixed_pattern
 
 xissue_add = function(xissue, xissues_file = xissues_default_file(), backup_file = xissues_default_backupfile()) {
 
+  if (is.null(xissue$xid) || !nzchar(trimws(as.character(xissue$xid)))) {
+    stop("xid cannot be empty.")
+  }
+
   if (file.exists(xissues_file)) {
     xi_df = readRDS(xissues_file)
   } else {
     xi_df = NULL
   }
-  xi_df = bind_rows(xi_df, xissue)
-  dupl = duplicated(xi_df %>% select(-time))
+
+  if (!is.null(xi_df) && nrow(xi_df) > 0 && xissue$xid %in% xi_df$xid) {
+    # Replace existing xissue with same xid
+    idx = which(xi_df$xid == xissue$xid)
+    xi_df[idx[1], ] = xissue
+
+    # Clean up any unexpected duplicates with the same xid
+    if (length(idx) > 1) {
+      xi_df = xi_df[-idx[-1], ]
+    }
+  } else {
+    xi_df = dplyr::bind_rows(xi_df, xissue)
+  }
+
+  dupl = duplicated(xi_df %>% dplyr::select(-time))
   xi_df = xi_df[!dupl,]
   xissues_df_save(xi_df, xissues_file, backup_file)
 }

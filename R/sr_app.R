@@ -121,7 +121,6 @@ sr_app = function(
       shiny::tabPanel("Repbox Problems",
         shiny::fluidRow(
           shiny::column(12,
-            shiny::p("Click a row to see detailed instances.", style = "font-size:12px; margin:2px 0; color:#666;"),
             shiny::div(class = "table-wrapper", DT::DTOutput("prob_summary_table"))
           )
         ),
@@ -139,13 +138,36 @@ sr_app = function(
   )
 
   server = function(input, output, session) {
+
+    # Load Initial XIssues to a ReactiveValue dataframe
+    xissues_file = xissues_default_file()
+    rxissues = shiny::reactiveVal(data.frame())
+
+    load_xissues = function() {
+      if (file.exists(xissues_file)) {
+        df = try(readRDS(xissues_file), silent = TRUE)
+        if (!inherits(df, "try-error") && is.data.frame(df)) {
+          rxissues(df)
+        }
+      }
+    }
+    load_xissues()
+
+    # Match static raw df_issues to currently active xissues
+    issues_with_xid = shiny::reactive({
+      df = df_issues
+      df$xid = sr_match_xissues(df, rxissues())
+      df
+    })
+
     sr_get_first_issue_pid = function() {
       sel = selected_issue_row()
 
-      cur_issues = df_issues %>%
+      cur_issues = issues_with_xid() %>%
         dplyr::filter(
           project_dir == sel$project_dir,
-          issue_category == sel$issue_category
+          issue_category == sel$issue_category,
+          xid == sel$xid
         )
 
       id_col = if ("pid" %in% names(cur_issues)) {
@@ -168,10 +190,11 @@ sr_app = function(
 
     # --- Regcheck Issues Logic ---
     summary_data = shiny::reactive({
-      if (NROW(df_issues) == 0) return(data.frame(Message = "No issues found"))
+      df = issues_with_xid()
+      if (NROW(df) == 0) return(data.frame(Message = "No issues found"))
 
-      df_issues %>%
-        dplyr::group_by(issue_category, project, project_dir) %>%
+      df %>%
+        dplyr::group_by(issue_category, artid, project_dir, xid) %>%
         dplyr::summarize(
           n_issues = dplyr::n(),
           cmd_counts = {
@@ -182,7 +205,11 @@ sr_app = function(
           },
           .groups = "drop"
         ) %>%
-        dplyr::arrange(issue_category, dplyr::desc(n_issues))
+        dplyr::arrange(
+          nzchar(xid), # nzchar == FALSE (0) -> ordered first, matched ones later
+          issue_category,
+          dplyr::desc(n_issues)
+        )
     })
 
     output$summary_table = DT::renderDT({
@@ -190,7 +217,7 @@ sr_app = function(
       if ("Message" %in% names(df)) return(DT::datatable(df, class = "compact stripe hover", options = sr_dt_opts(dom="t")))
 
       DT::datatable(
-        df %>% dplyr::select(Category = issue_category, Project = project, Issues = n_issues, Commands = cmd_counts),
+        df %>% dplyr::select(Category = issue_category, ArtID = artid, Issues = n_issues, Commands = cmd_counts, XID = xid),
         selection = "single",
         class = "compact stripe hover",
         options = sr_dt_opts(),
@@ -213,12 +240,14 @@ sr_app = function(
         )
       )
     })
+
     shiny::observeEvent(input$btn_study_and_close_issue, {
       project_dir = selected_issue_row()$project_dir
       pid = sr_get_first_issue_pid()
       sr_study_project(project_dir, pid)
       sr_close_app()
     })
+
     shiny::observeEvent(input$btn_rstudio_issue, {
       pdir = selected_issue_row()$project_dir
       try(rstudioapi::filesPaneNavigate(pdir), silent = TRUE)
@@ -238,8 +267,12 @@ sr_app = function(
       req(selected_issue_row())
       sel = selected_issue_row()
 
-      cur_issues = df_issues %>%
-        dplyr::filter(project == sel$project, issue_category == sel$issue_category)
+      cur_issues = issues_with_xid() %>%
+        dplyr::filter(
+          artid == sel$artid,
+          issue_category == sel$issue_category,
+          xid == sel$xid
+        )
 
       # Attempt lazy loading of data prep failure info if it's a failure category
       fail_cats = c("1. sb_raw, sb and rb failed but so exists",
@@ -291,7 +324,7 @@ sr_app = function(
       if (NROW(df_probs) == 0) return(data.frame(Message = "No repbox_problems found"))
 
       df_probs %>%
-        dplyr::group_by(type, project, project_dir) %>%
+        dplyr::group_by(problem_type, artid, project_dir) %>%
         dplyr::summarize(
           n_problems = dplyr::n(),
           .groups = "drop"
@@ -304,7 +337,7 @@ sr_app = function(
       if ("Message" %in% names(df)) return(DT::datatable(df, class = "compact stripe hover", options = sr_dt_opts(dom="t")))
 
       DT::datatable(
-        df %>% dplyr::select(Type = type, Project = project, Count = n_problems),
+        df %>% dplyr::select(Type = problem_type, ArtID = artid, Count = n_problems),
         selection = "single",
         class = "compact stripe hover",
         options = sr_dt_opts(),
@@ -353,9 +386,9 @@ sr_app = function(
       sel = selected_prob_row()
 
       cur_probs = df_probs %>%
-        dplyr::filter(project == sel$project, type == sel$type)
+        dplyr::filter(artid == sel$artid, problem_type == sel$problem_type)
 
-      show_cols = intersect(names(cur_probs), c("runid", "type", "msg", "fail_action", "file", "line"))
+      show_cols = intersect(names(cur_probs), c("runid", "pid", "problem_type", "problem_descr", "file", "line"))
       out_df = cur_probs %>% dplyr::select(dplyr::any_of(show_cols))
 
       DT::datatable(
@@ -367,18 +400,6 @@ sr_app = function(
     })
 
     # --- XIssues Logic ---
-    xissues_file = xissues_default_file()
-    rxissues = shiny::reactiveVal(data.frame())
-
-    load_xissues = function() {
-      if (file.exists(xissues_file)) {
-        df = try(readRDS(xissues_file), silent = TRUE)
-        if (!inherits(df, "try-error") && is.data.frame(df)) {
-          rxissues(df)
-        }
-      }
-    }
-    load_xissues()
 
     # Load initial yaml template if exists
     tpl_file = file.path(output_dir, "xissue_tpl_last.yaml")
@@ -429,32 +450,50 @@ sr_app = function(
       if (inherits(res, "try-error")) {
         shiny::showNotification(paste0("Error adding xissue: ", as.character(res)), type = "error")
       } else {
-        shiny::showNotification("Xissue added successfully.", type = "message")
+        shiny::showNotification("Xissue added/updated successfully.", type = "message")
         load_xissues()
       }
     })
 
-    # When clicking an issue row, create template
+    # When clicking an issue row, create or prefill template
     shiny::observeEvent(selected_issue_row(), {
       sel = selected_issue_row()
       req(sel)
 
-      cur_issues = df_issues %>%
+      cur_issues = issues_with_xid() %>%
         dplyr::filter(
           project_dir == sel$project_dir,
-          issue_category == sel$issue_category
+          issue_category == sel$issue_category,
+          xid == sel$xid
         )
       if (NROW(cur_issues) == 0) return()
 
-      first_issue = cur_issues[1, , drop=FALSE]
-      yaml_txt = sr_make_xissue_template(first_issue, sel$project)
-
-      # Check current text in xissue_yaml_text
+      # Check current text in xissue_yaml_text and back it up
       cur_txt = input$xissue_yaml_text
       if (is.character(cur_txt) && nzchar(trimws(cur_txt))) {
         old_file = file.path(output_dir, "xissue_tpl_old.yaml")
         dir.create(dirname(old_file), showWarnings=FALSE, recursive=TRUE)
         writeLines(cur_txt, old_file)
+      }
+
+      if (!is.null(sel$xid) && nzchar(sel$xid)) {
+        # Load the existing xissue directly into the editor
+        xi_df = rxissues()
+        xi = xi_df[xi_df$xid == sel$xid, , drop=FALSE]
+        if (NROW(xi) > 0) {
+          xi$time = format(xi$time)
+          yaml_txt = try(yaml::as.yaml(as.list(xi[1, ])), silent=TRUE)
+          if (inherits(yaml_txt, "try-error")) {
+            yaml_txt = sr_make_xissue_template(cur_issues[1, , drop=FALSE], sel$artid)
+          }
+        } else {
+          # Fallback
+          yaml_txt = sr_make_xissue_template(cur_issues[1, , drop=FALSE], sel$artid)
+        }
+      } else {
+        # Create a blank new template to fill out
+        first_issue = cur_issues[1, , drop=FALSE]
+        yaml_txt = sr_make_xissue_template(first_issue, sel$artid)
       }
 
       tpl_file = file.path(output_dir, "xissue_tpl_last.yaml")

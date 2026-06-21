@@ -1179,13 +1179,36 @@ sr_app = function(
   )
 
   server = function(input, output, session) {
+
+    # Load Initial XIssues to a ReactiveValue dataframe
+    xissues_file = xissues_default_file()
+    rxissues = shiny::reactiveVal(data.frame())
+
+    load_xissues = function() {
+      if (file.exists(xissues_file)) {
+        df = try(readRDS(xissues_file), silent = TRUE)
+        if (!inherits(df, "try-error") && is.data.frame(df)) {
+          rxissues(df)
+        }
+      }
+    }
+    load_xissues()
+
+    # Match static raw df_issues to currently active xissues
+    issues_with_xid = shiny::reactive({
+      df = df_issues
+      df$xid = sr_match_xissues(df, rxissues())
+      df
+    })
+
     sr_get_first_issue_pid = function() {
       sel = selected_issue_row()
 
-      cur_issues = df_issues %>%
+      cur_issues = issues_with_xid() %>%
         dplyr::filter(
           project_dir == sel$project_dir,
-          issue_category == sel$issue_category
+          issue_category == sel$issue_category,
+          xid == sel$xid
         )
 
       id_col = if ("pid" %in% names(cur_issues)) {
@@ -1208,10 +1231,11 @@ sr_app = function(
 
     # --- Regcheck Issues Logic ---
     summary_data = shiny::reactive({
-      if (NROW(df_issues) == 0) return(data.frame(Message = "No issues found"))
+      df = issues_with_xid()
+      if (NROW(df) == 0) return(data.frame(Message = "No issues found"))
 
-      df_issues %>%
-        dplyr::group_by(issue_category, project, project_dir) %>%
+      df %>%
+        dplyr::group_by(issue_category, project, project_dir, xid) %>%
         dplyr::summarize(
           n_issues = dplyr::n(),
           cmd_counts = {
@@ -1222,7 +1246,11 @@ sr_app = function(
           },
           .groups = "drop"
         ) %>%
-        dplyr::arrange(issue_category, dplyr::desc(n_issues))
+        dplyr::arrange(
+          nzchar(xid), # nzchar == FALSE (0) -> ordered first, matched ones later
+          issue_category,
+          dplyr::desc(n_issues)
+        )
     })
 
     output$summary_table = DT::renderDT({
@@ -1230,7 +1258,7 @@ sr_app = function(
       if ("Message" %in% names(df)) return(DT::datatable(df, class = "compact stripe hover", options = sr_dt_opts(dom="t")))
 
       DT::datatable(
-        df %>% dplyr::select(Category = issue_category, Project = project, Issues = n_issues, Commands = cmd_counts),
+        df %>% dplyr::select(Category = issue_category, Project = project, Issues = n_issues, Commands = cmd_counts, XID = xid),
         selection = "single",
         class = "compact stripe hover",
         options = sr_dt_opts(),
@@ -1253,12 +1281,14 @@ sr_app = function(
         )
       )
     })
+
     shiny::observeEvent(input$btn_study_and_close_issue, {
       project_dir = selected_issue_row()$project_dir
       pid = sr_get_first_issue_pid()
       sr_study_project(project_dir, pid)
       sr_close_app()
     })
+
     shiny::observeEvent(input$btn_rstudio_issue, {
       pdir = selected_issue_row()$project_dir
       try(rstudioapi::filesPaneNavigate(pdir), silent = TRUE)
@@ -1278,8 +1308,12 @@ sr_app = function(
       req(selected_issue_row())
       sel = selected_issue_row()
 
-      cur_issues = df_issues %>%
-        dplyr::filter(project == sel$project, issue_category == sel$issue_category)
+      cur_issues = issues_with_xid() %>%
+        dplyr::filter(
+          project == sel$project,
+          issue_category == sel$issue_category,
+          xid == sel$xid
+        )
 
       # Attempt lazy loading of data prep failure info if it's a failure category
       fail_cats = c("1. sb_raw, sb and rb failed but so exists",
@@ -1407,18 +1441,6 @@ sr_app = function(
     })
 
     # --- XIssues Logic ---
-    xissues_file = xissues_default_file()
-    rxissues = shiny::reactiveVal(data.frame())
-
-    load_xissues = function() {
-      if (file.exists(xissues_file)) {
-        df = try(readRDS(xissues_file), silent = TRUE)
-        if (!inherits(df, "try-error") && is.data.frame(df)) {
-          rxissues(df)
-        }
-      }
-    }
-    load_xissues()
 
     # Load initial yaml template if exists
     tpl_file = file.path(output_dir, "xissue_tpl_last.yaml")
@@ -1469,32 +1491,50 @@ sr_app = function(
       if (inherits(res, "try-error")) {
         shiny::showNotification(paste0("Error adding xissue: ", as.character(res)), type = "error")
       } else {
-        shiny::showNotification("Xissue added successfully.", type = "message")
+        shiny::showNotification("Xissue added/updated successfully.", type = "message")
         load_xissues()
       }
     })
 
-    # When clicking an issue row, create template
+    # When clicking an issue row, create or prefill template
     shiny::observeEvent(selected_issue_row(), {
       sel = selected_issue_row()
       req(sel)
 
-      cur_issues = df_issues %>%
+      cur_issues = issues_with_xid() %>%
         dplyr::filter(
           project_dir == sel$project_dir,
-          issue_category == sel$issue_category
+          issue_category == sel$issue_category,
+          xid == sel$xid
         )
       if (NROW(cur_issues) == 0) return()
 
-      first_issue = cur_issues[1, , drop=FALSE]
-      yaml_txt = sr_make_xissue_template(first_issue, sel$project)
-
-      # Check current text in xissue_yaml_text
+      # Check current text in xissue_yaml_text and back it up
       cur_txt = input$xissue_yaml_text
       if (is.character(cur_txt) && nzchar(trimws(cur_txt))) {
         old_file = file.path(output_dir, "xissue_tpl_old.yaml")
         dir.create(dirname(old_file), showWarnings=FALSE, recursive=TRUE)
         writeLines(cur_txt, old_file)
+      }
+
+      if (!is.null(sel$xid) && nzchar(sel$xid)) {
+        # Load the existing xissue directly into the editor
+        xi_df = rxissues()
+        xi = xi_df[xi_df$xid == sel$xid, , drop=FALSE]
+        if (NROW(xi) > 0) {
+          xi$time = format(xi$time)
+          yaml_txt = try(yaml::as.yaml(as.list(xi[1, ])), silent=TRUE)
+          if (inherits(yaml_txt, "try-error")) {
+            yaml_txt = sr_make_xissue_template(cur_issues[1, , drop=FALSE], sel$project)
+          }
+        } else {
+          # Fallback
+          yaml_txt = sr_make_xissue_template(cur_issues[1, , drop=FALSE], sel$project)
+        }
+      } else {
+        # Create a blank new template to fill out
+        first_issue = cur_issues[1, , drop=FALSE]
+        yaml_txt = sr_make_xissue_template(first_issue, sel$project)
       }
 
       tpl_file = file.path(output_dir, "xissue_tpl_last.yaml")
@@ -1547,6 +1587,7 @@ sr_study_project = function(project_dir, pid=NULL) {
 #' @return A data.frame of all issues combined and categorized.
 #' @export
 sr_aggregate_issues = function(project_dirs) {
+  restore.point("sr_aggregrate_issues")
   dfs = lapply(project_dirs, sr_get_project_issues)
   dfs = dfs[!vapply(dfs, is.null, logical(1))]
 
@@ -1565,6 +1606,8 @@ sr_aggregate_issues = function(project_dirs) {
 #' @return A data.frame of all problems combined.
 #' @export
 sr_aggregate_problems = function(project_dirs) {
+  restore.point("sr_aggregate_problems")
+
   dfs = lapply(project_dirs, sr_get_project_problems)
   dfs = dfs[!vapply(dfs, is.null, logical(1))]
 
@@ -1578,16 +1621,17 @@ sr_aggregate_problems = function(project_dirs) {
 }
 
 #' Get and categorize issues for a single project based on fine-tuned categories
-sr_get_project_issues = function(project_dir) {
+sr_get_project_issues = function(project_dir, parcels=list()) {
   restore.point("sr_get_project_issues")
-  regcheck = sr_read_parcel(project_dir, "regcheck")
+  library(repboxDB)
+
+  parcels = repdb_load_parcels(project_dir,c("regcheck", "reg"))
+  regcheck = parcels$regcheck
+  reg = parcels$reg
   if (is.null(regcheck) || NROW(regcheck) == 0) return(NULL)
-
   df_rc = as.data.frame(regcheck)
-
-  if (!"cmd" %in% names(df_rc)) {
-    df_rc$cmd = NA_character_
-  }
+  df_rc = left_join(df_rc, reg %>% select(runid, cmd, cmdline), by="runid") %>%
+    mutate(line=NA, file_path=NA)
 
   # Check if run worked
   reg_ok = sr_v_bool(df_rc$reg_ok, FALSE)
@@ -1642,36 +1686,25 @@ sr_get_project_issues = function(project_dir) {
 
   if (NROW(df_rc) == 0) return(NULL)
 
-  # Try to merge command line info from run_cmd if available for display
-  run_cmd = sr_read_parcel(project_dir, "stata_run_cmd")
-  if (!is.null(run_cmd) && "runid" %in% names(run_cmd)) {
-    rcmd = as.data.frame(run_cmd)
-    keep_rcmd = intersect(names(rcmd), c("runid", "cmdline", "file_path", "line"))
-    rcmd = rcmd[, keep_rcmd, drop = FALSE]
-
-    if (NROW(rcmd) > 0) {
-      df_rc = merge(df_rc, rcmd, by = "runid", all.x = TRUE, suffixes=c("", ".y"))
-      # Remove redundant merge columns
-      for (col in names(df_rc)) {
-        if (endsWith(col, ".y")) df_rc[[col]] = NULL
-      }
-    }
-  }
-
-  if (!"cmdline" %in% names(df_rc)) df_rc$cmdline = NA_character_
-
   df_rc
 }
 
 #' Get repbox_problems for a single project
 sr_get_project_problems = function(project_dir) {
-  probs = sr_read_parcel(project_dir, "repbox_problem")
+  restore.point("sr_get_project_problems")
+  if (!repdb_has_parcel(project_dir, "problem")) {
+    repboxRun::repbox_store_project_problems(project_dir = project_dir)
+  }
+  probs = repdb_load_parcels(project_dir, "problem")$problem
   if (is.null(probs) || NROW(probs) == 0) return(NULL)
 
   df_prob = as.data.frame(probs)
   df_prob$project = basename(project_dir)
   df_prob$project_dir = project_dir
 
+  # ignore some problems that are unimportant
+
+  df_prob = filter(df_prob, !stri_detect_fixed(df_prob$problem_type,"_journ_"))
   df_prob
 }
 ```
@@ -1842,6 +1875,72 @@ sr_xissue_pane_ui = function() {
   )
 }
 
+# Map issue category strings consistently to short failure categories
+sr_issue_to_failure_cat = function(cat) {
+  restore.point("sr_issue_to_failure_cat")
+  if (is.null(cat) || length(cat) == 0) return(character(0))
+  cat[is.na(cat)] = ""
+
+  failure_cat = rep("", length(cat))
+  failure_cat[grepl("sb_raw, sb and rb failed", cat)] = "sb_raw-sb-rb"
+  failure_cat[grepl("sb and rb failed", cat) & failure_cat == ""] = "sb-rb"
+  failure_cat[grepl("rb failed", cat) & failure_cat == ""] = "rb"
+  failure_cat[grepl("coefs don't match|coeffs don't match", cat, ignore.case = TRUE) & failure_cat == ""] = "coefs"
+  failure_cat[grepl("sb and so coefs", cat) & failure_cat == ""] = "so"
+
+  failure_cat
+}
+
+# Match issues dataframe against known xissues dataframe
+sr_match_xissues = function(df_issues, xi_df) {
+  restore.point("sr_match_xissues")
+  res_xid = rep("", nrow(df_issues))
+  if (NROW(xi_df) == 0 || NROW(df_issues) == 0) return(res_xid)
+
+  df_fail_cat = sr_issue_to_failure_cat(df_issues$issue_category)
+
+  df_cmd = stringi::stri_trim_both(as.character(df_issues$cmd))
+  df_cmd[is.na(df_cmd)] = ""
+
+  df_cmdline = as.character(df_issues$cmdline)
+  df_cmdline[is.na(df_cmdline)] = ""
+
+  for (i in seq_len(nrow(xi_df))) {
+    xi = xi_df[i, ]
+    if (is.null(xi$xid) || is.na(xi$xid) || !nzchar(xi$xid)) next
+
+    # 1. Failure mode match
+    match_mask = (df_fail_cat == xi$failure_cat)
+
+    # 2. Cmd match (if specified)
+    if (!is.null(xi$cmd) && nzchar(xi$cmd)) {
+      xi_cmds = stringi::stri_split_fixed(xi$cmd, ",")[[1]]
+      xi_cmds = stringi::stri_trim_both(xi_cmds)
+      xi_cmds = xi_cmds[nzchar(xi_cmds)]
+      if (length(xi_cmds) > 0) {
+        match_mask = match_mask & (df_cmd %in% xi_cmds)
+      }
+    }
+
+    # 3. Fixed pattern match (if specified)
+    if (!is.null(xi$fixed_pattern) && nzchar(xi$fixed_pattern)) {
+      rx = fixed_terms_to_regex(xi$fixed_pattern, space_to_ws = TRUE)
+      match_mask = match_mask & stringi::stri_detect_regex(df_cmdline, rx)
+    }
+
+    # 4. Regex pattern match (if specified)
+    if (!is.null(xi$rx_pattern) && nzchar(xi$rx_pattern)) {
+      match_mask = match_mask & stringi::stri_detect_regex(df_cmdline, xi$rx_pattern)
+    }
+
+    # Update matches that have not been assigned an xid yet (first match wins)
+    update_idx = match_mask & (res_xid == "")
+    res_xid[update_idx] = xi$xid
+  }
+
+  res_xid
+}
+
 # Create a YAML template from an issue
 sr_make_xissue_template = function(issue, project) {
   cmd = if (!is.null(issue$cmd)) issue$cmd else ""
@@ -1857,17 +1956,13 @@ sr_make_xissue_template = function(issue, project) {
   if (is.null(cat)) cat = ""
   if (is.na(cat)) cat = ""
 
-  failure_cat = ""
-  if (grepl("sb_raw, sb and rb failed", cat)) failure_cat = "sb_raw-sb-rb"
-  else if (grepl("sb and rb failed", cat)) failure_cat = "sb-rb"
-  else if (grepl("rb failed", cat)) failure_cat = "rb"
-  else if (grepl("coefs don't match|coeffs don't match", cat, ignore.case = TRUE)) failure_cat = "coefs"
-  else if (grepl("sb and so coefs", cat)) failure_cat = "so"
+  failure_cat = sr_issue_to_failure_cat(cat)
 
   artid = project
   if (is.null(artid)) artid = ""
 
   li = list(
+    xid = "",
     where = "reg",
     cmd = as.character(cmd),
     fixed_pattern = "",
@@ -1890,10 +1985,15 @@ sr_make_xissue_template = function(issue, project) {
 # FILE: /home/rstudio/repbox/repboxReportSummary/R/tools.R
 ```
 fixed_terms_to_regex = function(txt, space_to_ws = TRUE) {
+  if (length(txt) == 0 || all(!nzchar(txt))) return("")
+
   regex = stringi::stri_escape_unicode(txt)
+
+  # Properly escaped character class for ICU regex engine.
+  # Includes: . \ | ( ) [ ] { } ^ + * ? $ -
   regex = stringi::stri_replace_all_regex(
     regex,
-    "([][{}()+*^$|?.\\\\-])",
+    "([.\\\\|()\\[\\]{}^+*?$\\-])",
     "\\\\$1"
   )
 
@@ -1950,13 +2050,30 @@ xissue_make = function(xid="", where = c("reg", "mod")[1], cmd="", fixed_pattern
 
 xissue_add = function(xissue, xissues_file = xissues_default_file(), backup_file = xissues_default_backupfile()) {
 
+  if (is.null(xissue$xid) || !nzchar(trimws(as.character(xissue$xid)))) {
+    stop("xid cannot be empty.")
+  }
+
   if (file.exists(xissues_file)) {
     xi_df = readRDS(xissues_file)
   } else {
     xi_df = NULL
   }
-  xi_df = bind_rows(xi_df, xissue)
-  dupl = duplicated(xi_df %>% select(-time))
+
+  if (!is.null(xi_df) && nrow(xi_df) > 0 && xissue$xid %in% xi_df$xid) {
+    # Replace existing xissue with same xid
+    idx = which(xi_df$xid == xissue$xid)
+    xi_df[idx[1], ] = xissue
+
+    # Clean up any unexpected duplicates with the same xid
+    if (length(idx) > 1) {
+      xi_df = xi_df[-idx[-1], ]
+    }
+  } else {
+    xi_df = dplyr::bind_rows(xi_df, xissue)
+  }
+
+  dupl = duplicated(xi_df %>% dplyr::select(-time))
   xi_df = xi_df[!dupl,]
   xissues_df_save(xi_df, xissues_file, backup_file)
 }
@@ -2394,28 +2511,42 @@ is_negative = function(n) {
 ##################################
 
 
+The written code probably did not know actual structure of the problem data frame. Here is how it looks (an example):
 
-##################################
-# Your Task
-##################################
+>   df_prob
+         artid    problem_type
+1 aejapp_1_2_4 regvar_no_match
+2 aejapp_1_2_4 regvar_no_match
+3 aejapp_1_2_4 regvar_no_match
+4 aejapp_1_2_4 regvar_no_match
+5 aejapp_1_2_4           error
+6 aejapp_1_2_4           error
+7 aejapp_1_2_4           error
+                                                                                                                                                                problem_descr
+1                                                                                    The regression variable rgiv_hat could not be matched with any variable in the data set.
+2                                                                                    Column rgiv_hat does not exist in data set and thus I cannot generate the cterm rgiv_hat
+3                                                                                  The regression variable giving_hat could not be matched with any variable in the data set.
+4                                                                                Column giving_hat does not exist in data set and thus I cannot generate the cterm giving_hat
+5                                                  mrb_run_r_base_step: Error: Column giving_hat does not exist in data set and thus I cannot generate the cterm giving_hat\n
+6                                                      mrb_run_r_base_step: Error: Column rgiv_hat does not exist in data set and thus I cannot generate the cterm rgiv_hat\n
+7 mrb_run_r_base_step: Error in repboxDRF::drf_get_data(pid, drf = mrb$drf, filtered = FALSE, : No R code found for getting data and no cache found. That looks like a bug.\n
+       project                                project_dir
+1 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
+2 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
+3 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
+4 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
+5 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
+6 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
+7 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
 
-I have added a field xid to provide an id for an xisssue. Please implement:
+Curently when goin to the problem tab there is currently an error:
 
-- If an issue with the given xid already exists, replace it instead of adding a new issue with same issue. Also force a non-empty xid. 
+Listening on http://127.0.0.1:3345
+Warning: Error in dplyr::group_by: Must group by variables found in `.data`.
+✖ Column `type` is not found.
+  132: <Anonymous>
+Input to asJSON(keep_vec_names=TRUE) is a named vector. In a future version of jsonlite, this option will not be supported, and named vectors will be translated into arrays instead of objects. If you want JSON object output, please use a named list instead. See ?toJSON.
 
-- Add functionality with faster helper functions in xissues.R or sr_xissues.R to check whether an actual regcheck issue matches a specified xissue. Rules:
-  - If no pattern is specified just check whether failure mode fits and cmd fits
-  - If no cmd is specified check for failure mode and pattern
-  - Note that we may have multiple commands (comma separated list)
-  - Convert a fixed pattern to regex such that spaces will be replaced by general word boundaries.
-  - Use stringi
-  
-- If an issue matches an existing xissue show it in the issue list under the xid and put issues that match xid at the bottom of the table. Idea: we are mainly interested in dealing with new issues that have not already been characterized as an xissue.
 
-- Correspondingly if clicking on an issue that has an existing xissue, pre-fill the text area for the xissues with exactly that issue instead of generating a generic template.
-
-Does this all make sense? If not ask questions.
-
-Otherwise directly implement and explain beforehand what you have done.
-
+Can you explain and fix? Maybe we don't even need to generate the "project" field. Convention is that it is called artid.
 
