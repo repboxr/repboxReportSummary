@@ -1,0 +1,2216 @@
+
+Below is code from selected R projects from my repbox / metareg toolbox.
+
+
+
+# Package repboxReportSummary
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/DESCRIPTION
+```
+Package: repboxReportSummary
+Type: Package
+Title: Summary reports of Stata reproduction across multiple projects
+Version: 0.1.0
+Authors@R: c(
+    person(
+      "Sebastian", "Kranz",
+      email = "sebastian.kranz@uni-ulm.de",
+      role = c("aut", "cre")
+    )
+  )
+Description: Summary reports of Stata reproduction across multiple projects using a Shiny Dashboard.
+Depends: repboxDB, repboxUtils, stringi, htmltools, shiny, DT, dplyr, rstudioapi, restorepoint
+License: GPL 3.0
+Encoding: UTF-8
+LazyData: true
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/DESCRIPTION
+
+-----------------------------------------------------------
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/R/shiny_app_job.R
+```
+# General helpers for running one Shiny app instance as an RStudio job.
+#
+# Required packages:
+#   rstudioapi, ps, shiny, later, stringi
+#
+# app_id must be a stable, filesystem-safe identifier. Starting the same
+# app_id again stops the previous verified process and replaces its job.
+
+.shiny_job_require_packages = function(packages) {
+  missing = packages[
+    !vapply(
+      packages,
+      requireNamespace,
+      quietly = TRUE,
+      FUN.VALUE = logical(1L)
+    )
+  ]
+
+  if (length(missing) > 0L) {
+    stop(
+      "Missing required package(s): ",
+      stringi::stri_join(missing, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  invisible(TRUE)
+}
+
+
+.shiny_job_validate_app_id = function(app_id) {
+  if (
+    !is.character(app_id) ||
+    length(app_id) != 1L ||
+    is.na(app_id) ||
+    !nzchar(app_id) ||
+    !stringi::stri_detect_regex(app_id, "^[A-Za-z0-9._-]+$")
+  ) {
+    stop(
+      "app_id must contain only letters, digits, '.', '_' and '-'.",
+      call. = FALSE
+    )
+  }
+
+  app_id
+}
+
+
+.shiny_job_normalize_dir = function(path) {
+  dir.create(path, recursive = TRUE, showWarnings = FALSE)
+
+  normalizePath(
+    path,
+    winslash = "/",
+    mustWork = TRUE
+  )
+}
+
+
+.shiny_job_paths = function(app_id, output_dir) {
+  app_id = .shiny_job_validate_app_id(app_id)
+  output_dir = .shiny_job_normalize_dir(output_dir)
+
+  root_dir = file.path(output_dir, ".shiny-app-jobs")
+  app_dir = file.path(root_dir, app_id)
+
+  dir.create(app_dir, recursive = TRUE, showWarnings = FALSE)
+  app_dir = normalizePath(app_dir, winslash = "/", mustWork = TRUE)
+
+  list(
+    output_dir = output_dir,
+    root_dir = root_dir,
+    app_dir = app_dir,
+    state_path = file.path(app_dir, "state.rds"),
+    control_path = file.path(app_dir, "control.rds"),
+    registry_path = file.path(app_dir, "registry.rds")
+  )
+}
+
+
+.shiny_job_save_rds_atomic = function(object, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+
+  tmp_path = tempfile(
+    pattern = stringi::stri_c(".", basename(path), "-"),
+    tmpdir = dirname(path)
+  )
+  on.exit(unlink(tmp_path), add = TRUE)
+
+  saveRDS(object, tmp_path)
+
+  ok = file.rename(tmp_path, path)
+  if (!ok) {
+    ok = file.copy(tmp_path, path, overwrite = TRUE)
+  }
+  if (!ok) {
+    stop("Could not write file: ", path, call. = FALSE)
+  }
+
+  invisible(path)
+}
+
+
+.shiny_job_write_lines_atomic = function(text, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+
+  tmp_path = tempfile(
+    pattern = stringi::stri_c(".", basename(path), "-"),
+    tmpdir = dirname(path)
+  )
+  on.exit(unlink(tmp_path), add = TRUE)
+
+  writeLines(text, tmp_path, useBytes = TRUE)
+
+  ok = file.rename(tmp_path, path)
+  if (!ok) {
+    ok = file.copy(tmp_path, path, overwrite = TRUE)
+  }
+  if (!ok) {
+    stop("Could not write file: ", path, call. = FALSE)
+  }
+
+  invisible(path)
+}
+
+
+.shiny_job_read_rds = function(path) {
+  if (!file.exists(path)) {
+    return(NULL)
+  }
+
+  tryCatch(
+    readRDS(path),
+    error = function(e) NULL
+  )
+}
+
+
+.shiny_job_token = function() {
+  stringi::stri_rand_strings(
+    n = 1L,
+    length = 32L,
+    pattern = "[A-Za-z0-9]"
+  )
+}
+
+
+.shiny_job_r_literal = function(x) {
+  stringi::stri_join(
+    deparse(x, width.cutoff = 500L),
+    collapse = ""
+  )
+}
+
+
+.shiny_job_file_md5 = function(path) {
+  if (!file.exists(path)) {
+    return(NA_character_)
+  }
+
+  unname(as.character(tools::md5sum(path)))
+}
+
+
+.shiny_job_same_state = function(x, y) {
+  fields = c(
+    "format_version",
+    "app_id",
+    "token",
+    "pid",
+    "create_time",
+    "launcher_path",
+    "launcher_md5"
+  )
+
+  if (is.null(x) || is.null(y)) {
+    return(FALSE)
+  }
+
+  all(vapply(
+    fields,
+    function(field) identical(x[[field]], y[[field]]),
+    FUN.VALUE = logical(1L)
+  ))
+}
+
+
+.shiny_job_verify_process = function(state, app_id, paths) {
+  fail = function(reason) {
+    list(
+      verified = FALSE,
+      running = FALSE,
+      reason = reason,
+      handle = NULL
+    )
+  }
+
+  if (!is.list(state)) {
+    return(fail("No readable state file exists."))
+  }
+
+  required = c(
+    "format_version",
+    "app_id",
+    "token",
+    "pid",
+    "create_time",
+    "username",
+    "exe",
+    "cmdline",
+    "launcher_path",
+    "launcher_md5"
+  )
+  if (!all(required %in% names(state))) {
+    return(fail("The state file is incomplete."))
+  }
+
+  if (!identical(state$format_version, 1L)) {
+    return(fail("The state file has an unsupported format."))
+  }
+
+  if (!identical(state$app_id, app_id)) {
+    return(fail("The state file belongs to another app_id."))
+  }
+
+  if (
+    !is.character(state$token) ||
+    length(state$token) != 1L ||
+    !stringi::stri_detect_regex(state$token, "^[A-Za-z0-9]{32}$")
+  ) {
+    return(fail("The state token is invalid."))
+  }
+
+  scalar_character_fields = c(
+    "username",
+    "exe",
+    "launcher_path",
+    "launcher_md5"
+  )
+  valid_character_fields = all(vapply(
+    scalar_character_fields,
+    function(field) {
+      value = state[[field]]
+      is.character(value) &&
+        length(value) == 1L &&
+        !is.na(value) &&
+        nzchar(value)
+    },
+    FUN.VALUE = logical(1L)
+  ))
+  if (!valid_character_fields || !is.character(state$cmdline)) {
+    return(fail("The state file contains invalid process identity fields."))
+  }
+
+  pid = tryCatch(
+    suppressWarnings(as.integer(state$pid)),
+    error = function(e) NA_integer_
+  )
+  if (
+    length(pid) != 1L ||
+    is.na(pid) ||
+    pid <= 0L ||
+    identical(pid, Sys.getpid())
+  ) {
+    return(fail("The saved PID is invalid."))
+  }
+
+  expected_launcher = file.path(
+    paths$app_dir,
+    stringi::stri_c("launcher-", state$token, ".R")
+  )
+  expected_launcher = normalizePath(
+    expected_launcher,
+    winslash = "/",
+    mustWork = FALSE
+  )
+  saved_launcher = normalizePath(
+    state$launcher_path,
+    winslash = "/",
+    mustWork = FALSE
+  )
+
+  if (!identical(saved_launcher, expected_launcher)) {
+    return(fail("The saved launcher path is not valid for this app_id."))
+  }
+
+  if (!file.exists(saved_launcher)) {
+    return(fail("The saved launcher script no longer exists."))
+  }
+
+  expected_marker = stringi::stri_c(
+    "# shiny-app-job-v1 token=",
+    state$token
+  )
+  first_line = tryCatch(
+    readLines(saved_launcher, n = 1L, warn = FALSE),
+    error = function(e) character()
+  )
+  if (
+    length(first_line) != 1L ||
+    !identical(first_line, expected_marker)
+  ) {
+    return(fail("The launcher marker does not match the saved token."))
+  }
+
+  launcher_md5 = .shiny_job_file_md5(saved_launcher)
+  if (
+    is.na(launcher_md5) ||
+    !identical(launcher_md5, state$launcher_md5)
+  ) {
+    return(fail("The launcher checksum does not match."))
+  }
+
+  handle = tryCatch(
+    ps::ps_handle(pid),
+    error = function(e) NULL
+  )
+  if (is.null(handle)) {
+    return(fail("The saved PID does not exist."))
+  }
+
+  running = tryCatch(
+    ps::ps_is_running(handle),
+    error = function(e) FALSE
+  )
+  if (!isTRUE(running)) {
+    return(fail("The saved process is no longer running."))
+  }
+
+  current_create_time = tryCatch(
+    as.numeric(ps::ps_create_time(handle)),
+    error = function(e) NA_real_
+  )
+  saved_create_time = tryCatch(
+    suppressWarnings(as.numeric(state$create_time)),
+    error = function(e) NA_real_
+  )
+
+  if (
+    length(current_create_time) != 1L ||
+    length(saved_create_time) != 1L ||
+    is.na(current_create_time) ||
+    is.na(saved_create_time) ||
+    abs(current_create_time - saved_create_time) > 0.01
+  ) {
+    return(fail("The PID was reused by a different process."))
+  }
+
+  current_username = tryCatch(
+    ps::ps_username(handle),
+    error = function(e) NA_character_
+  )
+  caller_username = tryCatch(
+    ps::ps_username(ps::ps_handle()),
+    error = function(e) NA_character_
+  )
+
+  if (
+    is.na(current_username) ||
+    is.na(caller_username) ||
+    !identical(current_username, state$username) ||
+    !identical(current_username, caller_username)
+  ) {
+    return(fail("The process owner does not match."))
+  }
+
+  current_exe = tryCatch(
+    ps::ps_exe(handle),
+    error = function(e) NA_character_
+  )
+  if (
+    is.na(current_exe) ||
+    !identical(current_exe, state$exe)
+  ) {
+    return(fail("The process executable does not match."))
+  }
+
+  current_cmdline = tryCatch(
+    ps::ps_cmdline(handle),
+    error = function(e) character()
+  )
+  if (
+    length(current_cmdline) == 0L ||
+    !identical(as.character(current_cmdline), as.character(state$cmdline))
+  ) {
+    return(fail("The process command line does not match."))
+  }
+
+  has_launcher = any(
+    stringi::stri_detect_fixed(current_cmdline, saved_launcher),
+    na.rm = TRUE
+  )
+  if (!has_launcher) {
+    return(fail("The process command line does not contain the launcher path."))
+  }
+
+  list(
+    verified = TRUE,
+    running = TRUE,
+    reason = "The process identity was verified.",
+    handle = handle
+  )
+}
+
+
+.shiny_job_ids_by_name = function(jobs, job_name) {
+  if (is.null(jobs) || length(jobs) == 0L) {
+    return(character())
+  }
+
+  if (is.data.frame(jobs)) {
+    name_col = intersect(c("name", "job_name", "jobName"), names(jobs))
+    id_col = intersect(c("id", "job_id", "jobId"), names(jobs))
+
+    if (length(name_col) == 0L || length(id_col) == 0L) {
+      return(character())
+    }
+
+    keep = as.character(jobs[[name_col[[1L]]]]) == job_name
+    return(unique(as.character(jobs[[id_col[[1L]]]][keep])))
+  }
+
+  if (
+    is.list(jobs) &&
+    all(c("id", "name") %in% names(jobs)) &&
+    !is.list(jobs$name)
+  ) {
+    keep = as.character(jobs$name) == job_name
+    return(unique(as.character(jobs$id[keep])))
+  }
+
+  if (!is.list(jobs)) {
+    return(character())
+  }
+
+  ids = vapply(
+    seq_along(jobs),
+    function(i) {
+      job = jobs[[i]]
+
+      if (!is.list(job)) {
+        return("")
+      }
+
+      name = job$name
+      if (is.null(name)) {
+        name = job$jobName
+      }
+
+      if (
+        is.null(name) ||
+        length(name) == 0L ||
+        !identical(as.character(name[[1L]]), job_name)
+      ) {
+        return("")
+      }
+
+      id = job$id
+      if (is.null(id)) {
+        id = job$jobId
+      }
+      if (
+        is.null(id) &&
+        !is.null(names(jobs)) &&
+        nzchar(names(jobs)[[i]])
+      ) {
+        id = names(jobs)[[i]]
+      }
+
+      if (is.null(id) || length(id) == 0L) {
+        return("")
+      }
+
+      as.character(id[[1L]])
+    },
+    FUN.VALUE = character(1L)
+  )
+
+  unique(ids[nzchar(ids)])
+}
+
+
+.shiny_job_remove_pane_entries = function(job_name, registry_path) {
+  ids = character()
+
+  registry = .shiny_job_read_rds(registry_path)
+  if (
+    is.list(registry) &&
+    !is.null(registry$job_id) &&
+    length(registry$job_id) == 1L
+  ) {
+    ids = c(ids, as.character(registry$job_id))
+  }
+
+  jobs = tryCatch(
+    rstudioapi::jobList(),
+    error = function(e) NULL
+  )
+  ids = unique(c(ids, .shiny_job_ids_by_name(jobs, job_name)))
+  ids = ids[nzchar(ids)]
+
+  for (id in ids) {
+    try(rstudioapi::jobRemove(id), silent = TRUE)
+  }
+
+  unlink(registry_path)
+  invisible(ids)
+}
+
+
+shiny_app_job_status = function(
+    app_id,
+    output_dir
+) {
+  .shiny_job_require_packages(c("ps", "stringi"))
+
+  paths = .shiny_job_paths(app_id, output_dir)
+  state = .shiny_job_read_rds(paths$state_path)
+  verification = .shiny_job_verify_process(state, app_id, paths)
+
+  list(
+    app_id = app_id,
+    running = isTRUE(verification$running),
+    verified = isTRUE(verification$verified),
+    reason = verification$reason,
+    pid = if (is.list(state)) state$pid else NULL,
+    state = state
+  )
+}
+
+
+stop_shiny_app_job = function(
+    app_id,
+    output_dir,
+    job_name = app_id,
+    grace = 1500L,
+    remove_pane_entry = TRUE,
+    quiet = FALSE
+) {
+  .shiny_job_require_packages(c("ps", "stringi"))
+
+  paths = .shiny_job_paths(app_id, output_dir)
+
+  # This safely asks a launcher started by these helpers to stop itself.
+  .shiny_job_save_rds_atomic(
+    list(
+      format_version = 1L,
+      app_id = app_id,
+      active_token = NA_character_,
+      action = "stop",
+      updated_at = Sys.time()
+    ),
+    paths$control_path
+  )
+
+  state_before = .shiny_job_read_rds(paths$state_path)
+  verification = .shiny_job_verify_process(
+    state_before,
+    app_id,
+    paths
+  )
+
+  stopped = FALSE
+
+  if (isTRUE(verification$verified)) {
+    # Re-read the state immediately before sending a signal. If another launch
+    # changed it during verification, do not signal anything.
+    state_after = .shiny_job_read_rds(paths$state_path)
+
+    if (.shiny_job_same_state(state_before, state_after)) {
+      result = tryCatch(
+        ps::ps_kill(
+          verification$handle,
+          grace = as.integer(grace)
+        ),
+        error = function(e) e
+      )
+
+      stopped = !inherits(result, "error")
+
+      if (!stopped && !quiet) {
+        warning(
+          "The process was verified but could not be stopped: ",
+          conditionMessage(result),
+          call. = FALSE
+        )
+      }
+    } else if (!quiet) {
+      warning(
+        "The job state changed during verification; no signal was sent.",
+        call. = FALSE
+      )
+    }
+  } else if (
+    !is.null(state_before) &&
+    !quiet
+  ) {
+    warning(
+      "The saved PID was not signalled because process identity could not ",
+      "be established. Reason: ",
+      verification$reason,
+      " The control file still asks a compatible running Shiny job to stop ",
+      "itself.",
+      call. = FALSE
+    )
+  }
+
+  state_now = .shiny_job_read_rds(paths$state_path)
+  if (
+    stopped &&
+    .shiny_job_same_state(state_before, state_now)
+  ) {
+    unlink(paths$state_path)
+  }
+
+  can_use_rstudioapi =
+    requireNamespace("rstudioapi", quietly = TRUE) &&
+    rstudioapi::isAvailable()
+
+  if (remove_pane_entry && can_use_rstudioapi) {
+    .shiny_job_remove_pane_entries(
+      job_name,
+      paths$registry_path
+    )
+  }
+
+  invisible(list(
+    stopped = stopped,
+    verified = isTRUE(verification$verified),
+    reason = verification$reason,
+    pid = if (is.list(state_before)) state_before$pid else NULL
+  ))
+}
+
+
+.shiny_job_launcher = function(config_path, token) {
+  marker = stringi::stri_c(
+    "# shiny-app-job-v1 token=",
+    token
+  )
+
+  c(
+    marker,
+    stringi::stri_c(
+      "config_path = ",
+      .shiny_job_r_literal(config_path)
+    ),
+    "",
+    "save_rds_atomic = function(object, path) {",
+    "  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)",
+    "  tmp_path = tempfile(",
+    "    pattern = paste0(\".\", basename(path), \"-\"),",
+    "    tmpdir = dirname(path)",
+    "  )",
+    "  on.exit(unlink(tmp_path), add = TRUE)",
+    "  saveRDS(object, tmp_path)",
+    "  ok = file.rename(tmp_path, path)",
+    "  if (!ok) {",
+    "    ok = file.copy(tmp_path, path, overwrite = TRUE)",
+    "  }",
+    "  if (!ok) {",
+    "    stop(\"Could not write file: \", path, call. = FALSE)",
+    "  }",
+    "  invisible(path)",
+    "}",
+    "",
+    "read_rds = function(path) {",
+    "  if (!file.exists(path)) {",
+    "    return(NULL)",
+    "  }",
+    "  tryCatch(readRDS(path), error = function(e) NULL)",
+    "}",
+    "",
+    "config = readRDS(config_path)",
+    "control = read_rds(config$control_path)",
+    "if (",
+    "  is.null(control) ||",
+    "  !identical(control$app_id, config$app_id) ||",
+    "  !identical(control$active_token, config$token)",
+    ") {",
+    "  quit(save = \"no\", status = 0L)",
+    "}",
+    "",
+    "handle = ps::ps_handle()",
+    "state = list(",
+    "  format_version = 1L,",
+    "  app_id = config$app_id,",
+    "  token = config$token,",
+    "  pid = Sys.getpid(),",
+    "  create_time = as.numeric(ps::ps_create_time(handle)),",
+    "  username = ps::ps_username(handle),",
+    "  exe = ps::ps_exe(handle),",
+    "  cmdline = ps::ps_cmdline(handle),",
+    "  launcher_path = config$launcher_path,",
+    "  launcher_md5 = config$launcher_md5,",
+    "  started_at = Sys.time()",
+    ")",
+    "save_rds_atomic(state, config$state_path)",
+    "",
+    "cleanup = function() {",
+    "  current = read_rds(config$state_path)",
+    "  if (",
+    "    is.list(current) &&",
+    "    identical(current$app_id, config$app_id) &&",
+    "    identical(current$token, config$token)",
+    "  ) {",
+    "    unlink(config$state_path)",
+    "  }",
+    "  unlink(config_path)",
+    "  unlink(config$launcher_path)",
+    "}",
+    "on.exit(cleanup(), add = TRUE)",
+    "",
+    "check_control = function() {",
+    "  control = read_rds(config$control_path)",
+    "  is_current =",
+    "    is.list(control) &&",
+    "    identical(control$app_id, config$app_id) &&",
+    "    identical(control$active_token, config$token)",
+    "",
+    "  if (!is_current) {",
+    "    try(shiny::stopApp(), silent = TRUE)",
+    "    return(invisible(NULL))",
+    "  }",
+    "",
+    "  later::later(",
+    "    check_control,",
+    "    delay = config$control_check_interval",
+    "  )",
+    "}",
+    "later::later(",
+    "  check_control,",
+    "  delay = config$control_check_interval",
+    ")",
+    "",
+    "if (!is.null(config$package)) {",
+    "  target = get(",
+    "    config$fun,",
+    "    envir = asNamespace(config$package),",
+    "    inherits = FALSE",
+    "  )",
+    "} else {",
+    "  target_env = .GlobalEnv",
+    "",
+    "  if (length(config$source_files) > 0L) {",
+    "    target_env = new.env(parent = .GlobalEnv)",
+    "    for (source_file in config$source_files) {",
+    "      sys.source(source_file, envir = target_env)",
+    "    }",
+    "  }",
+    "",
+    "  target = get(",
+    "    config$fun,",
+    "    envir = target_env,",
+    "    inherits = TRUE",
+    "  )",
+    "}",
+    "",
+    "do.call(target, config$args)"
+  )
+}
+
+
+run_shiny_app_as_job = function(
+    app_id,
+    fun,
+    args = list(),
+    package = NULL,
+    source_files = character(),
+    output_dir,
+    job_name = app_id,
+    working_dir = getwd(),
+    import_env = FALSE,
+    replace = TRUE,
+    grace = 1500L,
+    control_check_interval = 1,
+    remove_old_pane_entry = TRUE
+) {
+  .shiny_job_require_packages(
+    c("rstudioapi", "ps", "shiny", "later", "stringi")
+  )
+
+  if (!rstudioapi::isAvailable()) {
+    stop(
+      "RStudio is required to run a background job.",
+      call. = FALSE
+    )
+  }
+
+  app_id = .shiny_job_validate_app_id(app_id)
+
+  if (
+    !is.character(fun) ||
+    length(fun) != 1L ||
+    is.na(fun) ||
+    !nzchar(fun)
+  ) {
+    stop("fun must be one function name.", call. = FALSE)
+  }
+
+  if (!is.list(args)) {
+    stop("args must be a list.", call. = FALSE)
+  }
+
+  if (!is.null(package)) {
+    if (
+      !is.character(package) ||
+      length(package) != 1L ||
+      is.na(package) ||
+      !nzchar(package)
+    ) {
+      stop("package must be NULL or one package name.", call. = FALSE)
+    }
+
+    if (length(source_files) > 0L) {
+      stop(
+        "Use either package or source_files, not both.",
+        call. = FALSE
+      )
+    }
+
+    if (!requireNamespace(package, quietly = TRUE)) {
+      stop(
+        "Package is not installed: ",
+        package,
+        call. = FALSE
+      )
+    }
+  }
+
+  if (
+    is.null(package) &&
+    length(source_files) == 0L &&
+    !isTRUE(import_env)
+  ) {
+    stop(
+      "Without package or source_files, import_env must be TRUE so that ",
+      "the job can find fun.",
+      call. = FALSE
+    )
+  }
+
+  if (
+    length(control_check_interval) != 1L ||
+    !is.numeric(control_check_interval) ||
+    is.na(control_check_interval) ||
+    control_check_interval <= 0
+  ) {
+    stop(
+      "control_check_interval must be one positive number.",
+      call. = FALSE
+    )
+  }
+
+  paths = .shiny_job_paths(app_id, output_dir)
+  working_dir = .shiny_job_normalize_dir(working_dir)
+
+  if (length(source_files) > 0L) {
+    source_files = normalizePath(
+      source_files,
+      winslash = "/",
+      mustWork = TRUE
+    )
+  }
+
+  if (replace) {
+    stop_shiny_app_job(
+      app_id = app_id,
+      output_dir = output_dir,
+      job_name = job_name,
+      grace = grace,
+      remove_pane_entry = remove_old_pane_entry,
+      quiet = TRUE
+    )
+  } else {
+    status = shiny_app_job_status(app_id, output_dir)
+    if (isTRUE(status$running)) {
+      stop(
+        "A verified job for this app_id is already running.",
+        call. = FALSE
+      )
+    }
+  }
+
+  token = .shiny_job_token()
+  launcher_path = file.path(
+    paths$app_dir,
+    stringi::stri_c("launcher-", token, ".R")
+  )
+  config_path = file.path(
+    paths$app_dir,
+    stringi::stri_c("config-", token, ".rds")
+  )
+
+  launcher = .shiny_job_launcher(config_path, token)
+  .shiny_job_write_lines_atomic(launcher, launcher_path)
+
+  launcher_path = normalizePath(
+    launcher_path,
+    winslash = "/",
+    mustWork = TRUE
+  )
+  launcher_md5 = .shiny_job_file_md5(launcher_path)
+
+  config = list(
+    format_version = 1L,
+    app_id = app_id,
+    token = token,
+    fun = fun,
+    args = args,
+    package = package,
+    source_files = source_files,
+    state_path = paths$state_path,
+    control_path = paths$control_path,
+    launcher_path = launcher_path,
+    launcher_md5 = launcher_md5,
+    control_check_interval = control_check_interval
+  )
+  .shiny_job_save_rds_atomic(config, config_path)
+
+  .shiny_job_save_rds_atomic(
+    list(
+      format_version = 1L,
+      app_id = app_id,
+      active_token = token,
+      action = "run",
+      updated_at = Sys.time()
+    ),
+    paths$control_path
+  )
+
+  job_id = tryCatch(
+    rstudioapi::jobRunScript(
+      path = launcher_path,
+      name = job_name,
+      workingDir = working_dir,
+      importEnv = import_env,
+      exportEnv = ""
+    ),
+    error = function(e) {
+      unlink(c(config_path, launcher_path))
+
+      control = .shiny_job_read_rds(paths$control_path)
+      if (
+        is.list(control) &&
+        identical(control$active_token, token)
+      ) {
+        unlink(paths$control_path)
+      }
+
+      stop(e)
+    }
+  )
+
+  .shiny_job_save_rds_atomic(
+    list(
+      format_version = 1L,
+      app_id = app_id,
+      token = token,
+      job_id = job_id,
+      job_name = job_name,
+      started_at = Sys.time()
+    ),
+    paths$registry_path
+  )
+
+  invisible(job_id)
+}
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/R/shiny_app_job.R
+
+-----------------------------------------------------------
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_addin.R
+```
+#' Run the Repbox Debug Report addin
+#'
+#' Opens the Repbox Debug Report Shiny application in the RStudio Viewer pane.
+#'
+#' @return Invisibly returns the result of [run_sr_app()].
+#' @export
+repbox_debug_report_addin = function() {
+  if (!rstudioapi::isAvailable()) {
+    stop("The Repbox Debug Report addin must be run inside RStudio.")
+  }
+
+  parent_dir = getOption(
+    "repboxReportSummary.parent_dir",
+    "/home/rstudio/repbox/projects"
+  )
+
+  invisible(run_sr_app(
+    parent_dir = parent_dir,
+    in_viewer = TRUE,
+    as_job = FALSE
+  ))
+}
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_addin.R
+
+-----------------------------------------------------------
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_app.R
+```
+example = function() {
+  library(repboxReportSummary)
+  parent_dir = "/home/rstudio/repbox/projects"
+  #undebug(run_shiny_app_as_job)
+  run_sr_app(parent_dir = parent_dir, in_viewer = TRUE,as_job = FALSE)
+  report_file = "/home/rstudio/repbox/reports/projects_summary.html"
+  browseURL(report_file)
+
+}
+run_sr_app = function(
+    parent_dir = NULL,
+    project_dirs = NULL,
+    in_viewer = FALSE,
+    as_job = FALSE,
+    output_dir = "/home/rstudio/repbox/reports",
+    job_name = "repbox report summary",
+    ...) {
+
+  library(repboxReportSummary)
+  if (as_job) {
+    return(invisible(run_sr_as_job(
+      parent_dir = parent_dir,
+      project_dirs = project_dirs,
+      in_viewer = in_viewer,
+      output_dir = output_dir,
+      job_name = job_name,
+      ...
+    )))
+  }
+
+  app = sr_app(
+    parent_dir = parent_dir,
+    project_dirs = project_dirs,
+    ...
+  )
+
+  if (in_viewer) {
+    launch_browser = rstudioapi::viewer
+  } else {
+    launch_browser = TRUE
+  }
+
+  shiny::runApp(app,launch.browser = launch_browser)
+}
+
+
+#' Run the interactive Repbox Debugger Shiny App
+#'
+#' @param project_dirs A vector of full paths to repbox project directories.
+#' @param parent_dir Optional parent directory containing project subdirectories.
+#' @param output_dir Output directory for any temporary files (not strictly required for Shiny view).
+#' @export
+sr_app = function(
+  parent_dir = NULL,
+  project_dirs = NULL,
+  output_dir = "/home/rstudio/repbox/reports",
+  ...
+) {
+  library(repboxReportSummary)
+
+  if (!is.null(parent_dir)) {
+    project_dirs = union(project_dirs, list.dirs(parent_dir, full.names = TRUE, recursive = FALSE))
+  }
+
+  if (length(project_dirs) == 0) {
+    stop("No project directories provided or found.")
+  }
+
+  message("Scanning projects for regcheck issues and repbox_problems... (This may take a moment)")
+
+  df_issues = sr_aggregate_issues(project_dirs)
+  df_probs = sr_aggregate_problems(project_dirs)
+
+  # Safety fallback to ensure cmd is available for summarize logic
+  if (NROW(df_issues) > 0 && !"cmd" %in% names(df_issues)) {
+    df_issues$cmd = "unknown"
+  }
+
+  message("Data loaded. Launching Shiny app...")
+
+  ui = shiny::fluidPage(
+    shiny::tags$head(
+      shiny::tags$style(shiny::HTML("
+        body { padding: 5px; }
+        .nav-tabs > li > a { padding: 2px 4px; font-size: 12px; }
+        .dataTables_wrapper { font-size: 12px; }
+        .dataTables_filter { margin-bottom: 4px; float: none !important; text-align: left; }
+        .dataTables_filter input { padding: 2px; height: auto; }
+        table.dataTable thead th {
+          position: sticky;
+          top: 0;
+          background-color: #f8f9fa !important;
+          z-index: 10;
+          box-shadow: inset 0 -1px 0 #ddd;
+          padding: 4px 8px;
+        }
+        table.dataTable tbody td { padding: 4px 8px; }
+        .btn-sm { padding: 2px 6px; font-size: 12px; }
+        .container-fluid { padding-left: 5px; padding-right: 5px; }
+        .col-sm-12 { padding-left: 0; padding-right: 0; }
+        .table-wrapper { max-height: 40vh; overflow: auto; border-bottom: 1px solid #ddd; margin-bottom: 10px; padding-left: 4px }
+      "))
+    ),
+    shiny::tabsetPanel(
+      # TAB 1: Regcheck Issues
+      shiny::tabPanel("Regcheck Issues",
+        shiny::fluidRow(
+          shiny::column(12,
+            shiny::div(class = "table-wrapper", DT::DTOutput("summary_table"))
+          )
+        ),
+        shiny::fluidRow(
+          shiny::column(12,
+            shiny::uiOutput("project_actions"),
+            shiny::div(class = "table-wrapper", DT::DTOutput("detail_table"))
+          )
+        )
+      ),
+
+      # TAB 2: Repbox Problems
+      shiny::tabPanel("Repbox Problems",
+        shiny::fluidRow(
+          shiny::column(12,
+            shiny::p("Click a row to see detailed instances.", style = "font-size:12px; margin:2px 0; color:#666;"),
+            shiny::div(class = "table-wrapper", DT::DTOutput("prob_summary_table"))
+          )
+        ),
+        shiny::fluidRow(
+          shiny::column(12,
+            shiny::uiOutput("prob_project_actions"),
+            shiny::div(class = "table-wrapper", DT::DTOutput("prob_detail_table"))
+          )
+        )
+      )
+    )
+  )
+
+  server = function(input, output, session) {
+    sr_get_first_issue_pid = function() {
+      sel = selected_issue_row()
+
+      cur_issues = df_issues %>%
+        dplyr::filter(
+          project_dir == sel$project_dir,
+          issue_category == sel$issue_category
+        )
+
+      id_col = if ("pid" %in% names(cur_issues)) {
+        "pid"
+      } else if ("runid" %in% names(cur_issues)) {
+        "runid"
+      } else {
+        return(NULL)
+      }
+
+      ids = cur_issues[[id_col]]
+      ids = ids[!is.na(ids)]
+
+      if (length(ids) == 0) {
+        return(NULL)
+      }
+
+      ids[[1]]
+    }
+
+    # --- Regcheck Issues Logic ---
+    summary_data = shiny::reactive({
+      if (NROW(df_issues) == 0) return(data.frame(Message = "No issues found"))
+
+      df_issues %>%
+        dplyr::group_by(issue_category, project, project_dir) %>%
+        dplyr::summarize(
+          n_issues = dplyr::n(),
+          cmd_counts = {
+            cmd_vals = as.character(cmd)
+            cmd_vals[is.na(cmd_vals) | cmd_vals == ""] = "unknown"
+            tab = sort(table(cmd_vals), decreasing = TRUE)
+            paste0(names(tab), ": ", tab, collapse = ", ")
+          },
+          .groups = "drop"
+        ) %>%
+        dplyr::arrange(issue_category, dplyr::desc(n_issues))
+    })
+
+    output$summary_table = DT::renderDT({
+      df = summary_data()
+      if ("Message" %in% names(df)) return(DT::datatable(df, class = "compact stripe hover", options = sr_dt_opts(dom="t")))
+
+      DT::datatable(
+        df %>% dplyr::select(Category = issue_category, Project = project, Issues = n_issues, Commands = cmd_counts),
+        selection = "single",
+        class = "compact stripe hover",
+        options = sr_dt_opts(),
+        rownames = FALSE
+      )
+    })
+
+    selected_issue_row = shiny::reactive({
+      req(input$summary_table_rows_selected)
+      summary_data()[input$summary_table_rows_selected, ]
+    })
+
+    output$project_actions = shiny::renderUI({
+      req(selected_issue_row())
+      shiny::tagList(
+        shiny::div(style = "margin: 5px 0; padding-left: 4px; !important",
+          shiny::actionButton("btn_study_and_close_issue", "Study and close", class = "btn-sm btn-default"),
+          shiny::actionButton("btn_rstudio_issue", "Show in Files", icon = shiny::icon("folder-open"), class = "btn-sm btn-default"),
+          shiny::actionButton("btn_report_issue", "do_report.html", icon = shiny::icon("file-code"), class = "btn-sm btn-default")
+        )
+      )
+    })
+    shiny::observeEvent(input$btn_study_and_close_issue, {
+      project_dir = selected_issue_row()$project_dir
+      pid = sr_get_first_issue_pid()
+      sr_study_project(project_dir, pid)
+        sr_study_project(project_dir)
+        sr_close_app()
+    })
+    shiny::observeEvent(input$btn_rstudio_issue, {
+      pdir = selected_issue_row()$project_dir
+      try(rstudioapi::filesPaneNavigate(pdir), silent = TRUE)
+    })
+
+    shiny::observeEvent(input$btn_report_issue, {
+      pdir = selected_issue_row()$project_dir
+      rep_file = file.path(pdir, "reports", "do_report.html")
+      if (file.exists(rep_file)) {
+        try(utils::browseURL(rep_file), silent = TRUE)
+      } else {
+        shiny::showNotification("do_report.html not found in project.", type = "warning")
+      }
+    })
+
+    output$detail_table = DT::renderDT({
+      req(selected_issue_row())
+      sel = selected_issue_row()
+
+      cur_issues = df_issues %>%
+        dplyr::filter(project == sel$project, issue_category == sel$issue_category)
+
+      # Attempt lazy loading of data prep failure info if it's a failure category
+      fail_cats = c("1. sb_raw, sb and rb failed but so exists",
+                    "2. sb and rb failed but sb_raw exists",
+                    "3. rb failed")
+
+      if (sel$issue_category %in% fail_cats) {
+        pdir = sel$project_dir
+        # Only load DRF safely
+        drf = try(repboxDRF::drf_load(pdir, apply_caches = FALSE), silent = TRUE)
+        if (!inherits(drf, "try-error") && !is.null(drf$r_err_runids) && length(drf$r_err_runids) > 0 && !is.null(drf$path_df)) {
+
+          cur_issues$failed_prep_runid = NA_integer_
+          cur_issues$failed_prep_cmd = NA_character_
+
+          err_runids = drf$r_err_runids
+          for (i in seq_len(nrow(cur_issues))) {
+            pid = cur_issues$runid[i]
+            path = drf$path_df$runid[drf$path_df$pid == pid]
+            bad_runids = intersect(path, err_runids)
+            if (length(bad_runids) > 0) {
+              first_bad = min(bad_runids)
+              cur_issues$failed_prep_runid[i] = first_bad
+              cmd_val = drf$run_df$cmd[drf$run_df$runid == first_bad]
+              if (length(cmd_val) > 0) cur_issues$failed_prep_cmd[i] = cmd_val[1]
+            }
+          }
+        }
+      }
+
+      show_cols = c("runid", "cmd")
+      if ("problem" %in% names(cur_issues)) show_cols = c(show_cols, "problem")
+      if ("cmdline" %in% names(cur_issues)) show_cols = c(show_cols, "cmdline")
+      if ("failed_prep_runid" %in% names(cur_issues)) show_cols = c(show_cols, "failed_prep_runid", "failed_prep_cmd")
+
+      out_df = cur_issues %>% dplyr::select(dplyr::any_of(show_cols))
+
+      DT::datatable(
+        out_df,
+        class = "compact stripe hover",
+        options = sr_dt_opts(),
+        rownames = FALSE
+      )
+    })
+
+
+    # --- Repbox Problems Logic ---
+    prob_summary_data = shiny::reactive({
+      if (NROW(df_probs) == 0) return(data.frame(Message = "No repbox_problems found"))
+
+      df_probs %>%
+        dplyr::group_by(type, project, project_dir) %>%
+        dplyr::summarize(
+          n_problems = dplyr::n(),
+          .groups = "drop"
+        ) %>%
+        dplyr::arrange(dplyr::desc(n_problems))
+    })
+
+    output$prob_summary_table = DT::renderDT({
+      df = prob_summary_data()
+      if ("Message" %in% names(df)) return(DT::datatable(df, class = "compact stripe hover", options = sr_dt_opts(dom="t")))
+
+      DT::datatable(
+        df %>% dplyr::select(Type = type, Project = project, Count = n_problems),
+        selection = "single",
+        class = "compact stripe hover",
+        options = sr_dt_opts(),
+        rownames = FALSE
+      )
+    })
+
+    selected_prob_row = shiny::reactive({
+      req(input$prob_summary_table_rows_selected)
+      prob_summary_data()[input$prob_summary_table_rows_selected, ]
+    })
+
+    output$prob_project_actions = shiny::renderUI({
+      req(selected_prob_row())
+      shiny::tagList(
+        shiny::div(style = "margin: 5px 0;",
+          shiny::actionButton("btn_study_and_close", "Study and close", class = "btn-sm btn-default"),
+          shiny::actionButton("btn_rstudio_prob", "Files", icon = shiny::icon("folder-open"), class = "btn-sm btn-default"),
+          shiny::actionButton("btn_report_prob", "Report", icon = shiny::icon("file-code"), class = "btn-sm btn-default")
+        )
+      )
+    })
+    shiny::observeEvent(input$btn_study_and_close, {
+      project_dir = selected_prob_row()$project_dir
+      sr_study_project(project_dir)
+      sr_close_app()
+    })
+
+    shiny::observeEvent(input$btn_rstudio_prob, {
+      pdir = selected_prob_row()$project_dir
+      try(rstudioapi::filesPaneNavigate(pdir), silent = TRUE)
+    })
+
+    shiny::observeEvent(input$btn_report_prob, {
+      pdir = selected_prob_row()$project_dir
+      rep_file = file.path(pdir, "reports", "do_report.html")
+      if (file.exists(rep_file)) {
+        try(utils::browseURL(rep_file), silent = TRUE)
+      } else {
+        shiny::showNotification("do_report.html not found in project.", type = "warning")
+      }
+    })
+
+    output$prob_detail_table = DT::renderDT({
+      req(selected_prob_row())
+      sel = selected_prob_row()
+
+      cur_probs = df_probs %>%
+        dplyr::filter(project == sel$project, type == sel$type)
+
+      show_cols = intersect(names(cur_probs), c("runid", "type", "msg", "fail_action", "file", "line"))
+      out_df = cur_probs %>% dplyr::select(dplyr::any_of(show_cols))
+
+      DT::datatable(
+        out_df,
+        class = "compact stripe hover",
+        options = sr_dt_opts(),
+        rownames = FALSE
+      )
+    })
+
+  }
+
+  shiny::shinyApp(ui, server)
+}
+
+
+sr_close_app = function() {
+  shiny::stopApp()
+}
+
+sr_study_project = function(project_dir, pid=NULL) {
+  restore.point("sr_study_project")
+  .GlobalEnv$project_dir = project_dir
+  try(rstudioapi::filesPaneNavigate(file.path(project_dir, "run")))
+  try(rstudioapi::navigateToFile(file.path(project_dir, "run/run_test_data_path.R")))
+  rep_file = file.path(project_dir, "reports", "do_report.html")
+  try(utils::browseURL(rep_file), silent = TRUE)
+
+  # Make the Files pane the active RStudio pane.
+  try(
+    rstudioapi::executeCommand("activateFiles", quiet = TRUE),
+    silent = TRUE
+  )
+  if (!is.null(pid)) {
+    cat("\npid = ", pid)
+    .GlobalEnv$pid = pid
+  }
+
+}
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_app.R
+
+-----------------------------------------------------------
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_data.R
+```
+#' Aggregate issues from multiple project directories
+#'
+#' @param project_dirs Character vector of repbox project directories.
+#' @return A data.frame of all issues combined and categorized.
+#' @export
+sr_aggregate_issues = function(project_dirs) {
+  dfs = lapply(project_dirs, sr_get_project_issues)
+  dfs = dfs[!vapply(dfs, is.null, logical(1))]
+
+  if (length(dfs) == 0) {
+    return(data.frame())
+  }
+
+  res = dplyr::bind_rows(dfs)
+  rownames(res) = NULL
+  res
+}
+
+#' Aggregate repbox_problems from multiple project directories
+#'
+#' @param project_dirs Character vector of repbox project directories.
+#' @return A data.frame of all problems combined.
+#' @export
+sr_aggregate_problems = function(project_dirs) {
+  dfs = lapply(project_dirs, sr_get_project_problems)
+  dfs = dfs[!vapply(dfs, is.null, logical(1))]
+
+  if (length(dfs) == 0) {
+    return(data.frame())
+  }
+
+  res = do.call(rbind, dfs)
+  rownames(res) = NULL
+  res
+}
+
+#' Get and categorize issues for a single project based on fine-tuned categories
+sr_get_project_issues = function(project_dir) {
+  restore.point("sr_get_project_issues")
+  regcheck = sr_read_parcel(project_dir, "regcheck")
+  if (is.null(regcheck) || NROW(regcheck) == 0) return(NULL)
+
+  df_rc = as.data.frame(regcheck)
+
+  if (!"cmd" %in% names(df_rc)) {
+    df_rc$cmd = NA_character_
+  }
+
+  # Check if run worked
+  reg_ok = sr_v_bool(df_rc$reg_ok, FALSE)
+
+  # Identify variables safely
+  so_exists = sr_v_bool(df_rc$so_raw_did_run, FALSE) | sr_v_bool(df_rc$so_did_run, FALSE)
+  sb_raw_exists = sr_v_bool(df_rc$sb_raw_did_run, FALSE)
+  sb_failed = !sr_v_bool(df_rc$sb_did_run, FALSE)
+  rb_failed = !sr_v_bool(df_rc$rb_did_run, FALSE)
+
+  sb_so_diff = !sr_v_bool(df_rc$sb_so_identical, TRUE)
+  share_same = sr_v_num(df_rc$rb_sb_share_coeff_same, 1)
+  coef_mismatch_share = 1 - share_same
+
+  cmd_col = tolower(as.character(df_rc$cmd))
+  cmd_col[is.na(cmd_col)] = ""
+  is_logit_probit = grepl("logit|probit", cmd_col)
+
+  cat = rep("8. Other issues", NROW(df_rc))
+
+  # 1. sb_raw, sb and rb failed but so exists
+  mask1 = !sb_raw_exists & sb_failed & rb_failed & so_exists
+  # 2. sb and rb failed but sb_raw exists
+  mask2 = sb_raw_exists & sb_failed & rb_failed
+  # 3. rb failed
+  mask3 = !mask1 & !mask2 & rb_failed
+  # 4. > 20% coeffs don't match between sb and rb and not a logit or probit command
+  mask4 = !rb_failed & (coef_mismatch_share > 0.2) & !is_logit_probit
+  # 5. sb and so coefs don't match
+  mask5 = !rb_failed & !mask4 & sb_so_diff
+  # 6. < 20% coeffs don't match (i.e. > 0 and <= 0.2)
+  mask6 = !rb_failed & !mask4 & !mask5 & (coef_mismatch_share > 0 & coef_mismatch_share <= 0.2) & !is_logit_probit
+  # 7. coefs don't match but logit or probit
+  mask7 = !rb_failed & (coef_mismatch_share > 0) & is_logit_probit
+
+  # Apply masks to category (later masks overwrite earlier ones if overlapping, though constructed to be mostly exclusive)
+  cat[mask7] = "7. Coefs don't match but logit/probit"
+  cat[mask6] = "6. < 20% coeffs don't match"
+  cat[mask5] = "5. sb and so coefs don't match"
+  cat[mask4] = "4. > 20% coeffs don't match (not logit/probit)"
+  cat[mask3] = "3. rb failed"
+  cat[mask2] = "2. sb and rb failed but sb_raw exists"
+  cat[mask1] = "1. sb_raw, sb and rb failed but so exists"
+
+  df_rc$issue_category = cat
+  df_rc$project = basename(project_dir)
+  df_rc$project_dir = project_dir
+
+  # Filter only actual issues
+  is_issue = !reg_ok | (cat != "8. Other issues") | (!is.na(df_rc$problem) & nzchar(as.character(df_rc$problem)))
+  df_rc = df_rc[is_issue, , drop = FALSE]
+
+  if (NROW(df_rc) == 0) return(NULL)
+
+  # Try to merge command line info from run_cmd if available for display
+  run_cmd = sr_read_parcel(project_dir, "stata_run_cmd")
+  if (!is.null(run_cmd) && "runid" %in% names(run_cmd)) {
+    rcmd = as.data.frame(run_cmd)
+    keep_rcmd = intersect(names(rcmd), c("runid", "cmdline", "file_path", "line"))
+    rcmd = rcmd[, keep_rcmd, drop = FALSE]
+
+    if (NROW(rcmd) > 0) {
+      df_rc = merge(df_rc, rcmd, by = "runid", all.x = TRUE, suffixes=c("", ".y"))
+      # Remove redundant merge columns
+      for (col in names(df_rc)) {
+        if (endsWith(col, ".y")) df_rc[[col]] = NULL
+      }
+    }
+  }
+
+  if (!"cmdline" %in% names(df_rc)) df_rc$cmdline = NA_character_
+
+  df_rc
+}
+
+#' Get repbox_problems for a single project
+sr_get_project_problems = function(project_dir) {
+  probs = sr_read_parcel(project_dir, "repbox_problem")
+  if (is.null(probs) || NROW(probs) == 0) return(NULL)
+
+  df_prob = as.data.frame(probs)
+  df_prob$project = basename(project_dir)
+  df_prob$project_dir = project_dir
+
+  df_prob
+}
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_data.R
+
+-----------------------------------------------------------
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_html.R
+```
+example = function() {
+  library(repboxReportSummary)
+  parent_dir = "/home/rstudio/repbox/projects"
+  sr_summary_report(parent_dir = parent_dir)
+  report_file = "/home/rstudio/repbox/reports/projects_summary.html"
+  browseURL(report_file)
+
+}
+
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_html.R
+
+-----------------------------------------------------------
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_job.R
+```
+run_sr_as_job = function(
+    parent_dir = NULL,
+    project_dirs = NULL,
+    in_viewer = FALSE,
+    output_dir = "/home/rstudio/repbox/reports",
+    job_name = "repbox report summary",
+    ...) {
+
+  app_args = c(
+    list(
+      parent_dir = parent_dir,
+      project_dirs = project_dirs,
+      in_viewer = in_viewer,
+      as_job = FALSE,
+      output_dir = output_dir,
+      job_name = job_name
+    ),
+    list(...)
+  )
+
+  run_shiny_app_as_job(
+    app_id = "repbox-report-summary",
+    fun = "run_sr_app",
+    args = app_args,
+    package = "repboxReportSummary",
+    output_dir = output_dir,
+    job_name = job_name,
+    working_dir = getwd(),
+    replace = TRUE
+  )
+}
+
+
+
+
+# Optional manual controls:
+
+stop_sr_app = function(
+    output_dir = "/home/rstudio/repbox/reports",
+    job_name = "repbox report summary"
+) {
+  stop_shiny_app_job(
+    app_id = "repbox-report-summary",
+    output_dir = output_dir,
+    job_name = job_name
+  )
+}
+
+
+sr_app_job_status = function(
+    output_dir = "/home/rstudio/repbox/reports"
+) {
+  shiny_app_job_status(
+    app_id = "repbox-report-summary",
+    output_dir = output_dir
+  )
+}
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_job.R
+
+-----------------------------------------------------------
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_utils.R
+```
+# Utility functions for repboxReportSummary
+
+sr_v_bool = function(x, default = FALSE) {
+  if (is.null(x) || length(x) == 0) return(logical(0))
+  if (is.logical(x)) {
+    x[is.na(x)] = default
+    return(x)
+  }
+  if (is.numeric(x) || is.integer(x)) {
+    x[is.na(x)] = if(default) 1 else 0
+    return(x != 0)
+  }
+  x = tolower(trimws(as.character(x)))
+  x[is.na(x)] = if (default) "true" else "false"
+  x %in% c("true", "t", "yes", "y", "1")
+}
+
+sr_v_num = function(x, default = 0) {
+  if (is.null(x) || length(x) == 0) return(numeric(0))
+  x = suppressWarnings(as.numeric(x))
+  x[is.na(x)] = default
+  x
+}
+
+sr_read_parcel = function(project_dir, parcel_name) {
+  file = file.path(project_dir, "repdb", paste0(parcel_name, ".Rds"))
+  if (!file.exists(file)) return(NULL)
+
+  obj = readRDS(file)
+
+  if (is.list(obj) && !inherits(obj, "data.frame") && parcel_name %in% names(obj)) {
+    obj = obj[[parcel_name]]
+  } else if (is.list(obj) && !inherits(obj, "data.frame") && length(obj) == 1) {
+    if (inherits(obj[[1]], "data.frame")) {
+      obj = obj[[1]]
+    }
+  }
+
+  obj
+}
+
+#' Default options for slim DataTables
+#'
+#' @param dom The dom layout string for DataTables.
+#' @param ... Additional options passed to DataTables.
+#' @export
+sr_dt_opts = function(dom = "ft", ...) {
+  list(
+    dom = dom,
+    paging = FALSE,
+    info = FALSE,
+    ordering = TRUE,
+    autoWidth = FALSE,
+    ...
+  )
+}
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/R/sr_utils.R
+
+-----------------------------------------------------------
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/R/tools.R
+```
+fixed_terms_to_regex = function(txt, space_to_ws = TRUE) {
+  regex = stringi::stri_escape_unicode(txt)
+  regex = stringi::stri_replace_all_regex(
+    regex,
+    "([][{}()+*^$|?.\\\\-])",
+    "\\\\$1"
+  )
+
+  if (space_to_ws) {
+    regex = stringi::stri_replace_all_fixed(regex, " ", "\\s+")
+  }
+
+  stringi::stri_join("(?:", regex, ")", collapse = "|")
+}
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/R/tools.R
+
+-----------------------------------------------------------
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/R/xissues.R
+```
+# Helper functions to store info about expected issues
+# Some issues will be expected and not solved by our repbox
+# pipeline, but we want to know what those issues are
+# and store them systematically
+
+example = function() {
+  xissue = xissue_make("reg", "ivregress","ivregress liml ","coefs","LIML estimation not yet translated" )
+  xissue_add(xissue)
+  rstudioapi::filesPaneNavigate(dirname(xissues_text_file()))
+}
+
+
+xissue_failure_cats = function() {
+  c("rb", "sb-rb", "sb_raw-sb-rb", "coefs","so", "")
+}
+
+# artids: example artids that have the problem
+# pids: example pid that have the problem if there are multiple artid map one-to-one to artid with recycling
+xissue_make = function(where = c("reg", "mod")[1], cmd="", fixed_pattern = "",  failure_cat = "" , descr="", artids="", pids="", time=Sys.time(), rx_pattern="") {
+  if (length(cmd)>1) {
+    cmd = paste0(cmd, collapse=",")
+  }
+  if (length(artids)>1) {
+    artids = paste0(artids, collapse=",")
+  }
+  if (length(pids)>1) {
+    pids = paste0(pids, collapse=",")
+  }
+  xissue = as.data.frame(as.list(environment()))
+  if (!xissue$failure_cat %in% xissue_failure_cats()) {
+    stop(paste0("\nNo allowable failure_cat=",xissue$failure_cat))
+  }
+  xissue
+}
+
+xissue_add = function(xissue, xissues_file = xissues_default_file(), backup_file = xissues_default_backupfile()) {
+
+  if (file.exists(xissues_file)) {
+    xi_df = readRDS(xissues_file)
+  } else {
+    xi_df = NULL
+  }
+  xi_df = bind_rows(xi_df, xissue)
+  dupl = duplicated(xi_df %>% select(-time))
+  xi_df = xi_df[!dupl,]
+
+  try({
+    saveRDS(xi_df, xissues_file)
+    saveRDS(xi_df, backup_file)
+    xissues_as_text(xi_df)
+  })
+}
+
+xissues_as_text = function(xi_df, text_file = xissues_text_file()) {
+  restore.point("xissues_as_text")
+  xi_df = xi_df %>%
+    arrange(desc(time))
+
+  library(yaml)
+  xi_df$time = format(xi_df$time)
+  txt = yaml::as.yaml(xi_df, column.major = FALSE, indent=2)
+  writeLines(txt, text_file)
+
+}
+
+xissues_text_file = function() {
+  normalizePath("~/repbox/reports/xissues.txt", mustWork = FALSE)
+}
+
+
+xissues_default_file = function() {
+  normalizePath("~/repbox/reports/xissues.Rds", mustWork = FALSE)
+}
+
+xissues_default_backupfile = function() {
+  normalizePath("~/repbox/reports/xissues_backup.Rds", mustWork = FALSE)
+}
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/R/xissues.R
+
+-----------------------------------------------------------
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/inst/www/sr_report.css
+```
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #f8fafc;
+  color: #1e293b;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+}
+
+.sr-header {
+  background: #ffffff;
+  padding: 20px 30px;
+  border-bottom: 1px solid #e2e8f0;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.sr-header h1 {
+  margin: 0 0 5px 0;
+  font-size: 22px;
+  color: #0f172a;
+}
+
+.sr-header p {
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.sr-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.sr-empty-state {
+  text-align: center;
+  padding: 50px;
+  background: #fff;
+  border-radius: 8px;
+  border: 1px dashed #cbd5e1;
+  color: #64748b;
+}
+
+.sr-category-section {
+  background: #ffffff;
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  border: 1px solid #e2e8f0;
+  margin-bottom: 24px;
+  overflow: hidden;
+}
+
+.sr-category-header {
+  background: #f1f5f9;
+  padding: 12px 16px;
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sr-category-header h3 {
+  margin: 0;
+  font-size: 16px;
+  color: #334155;
+}
+
+.sr-badge {
+  background: #cbd5e1;
+  color: #1e293b;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.sr-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.sr-table th {
+  text-align: left;
+  padding: 10px 16px;
+  background: #ffffff;
+  border-bottom: 1px solid #e2e8f0;
+  color: #64748b;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.sr-table td {
+  padding: 10px 16px;
+  border-bottom: 1px solid #f1f5f9;
+  vertical-align: top;
+}
+
+.sr-issue-row {
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.sr-issue-row:hover {
+  background: #f8fafc;
+}
+
+.sr-issue-row.active {
+  background: #eff6ff;
+}
+
+.sr-proj-cell {
+  font-weight: 600;
+  color: #2563eb;
+}
+
+.sr-table code {
+  font-family: Menlo, Monaco, Consolas, monospace;
+  font-size: 12.5px;
+  background: #f1f5f9;
+  padding: 2px 4px;
+  border-radius: 4px;
+  color: #b91c1c;
+}
+
+.sr-detail-row td {
+  padding: 0;
+  border-bottom: 2px solid #e2e8f0;
+  background: #f8fafc;
+}
+
+.sr-detail-box {
+  padding: 12px 16px;
+  border-left: 4px solid #3b82f6;
+}
+
+.sr-detail-grid {
+  display: grid;
+  grid-template-columns: max-content auto;
+  gap: 4px 10px;
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+
+.sr-detail-grid strong {
+  color: #475569;
+}
+
+.sr-detail-box pre {
+  margin: 0;
+  background: #1e293b;
+  color: #f8fafc;
+  padding: 10px;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+.sr-detail-box pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/inst/www/sr_report.css
+
+-----------------------------------------------------------
+
+
+# FILE: /home/rstudio/repbox/repboxReportSummary/inst/www/sr_report.js
+```
+document.addEventListener("DOMContentLoaded", function() {
+  var rows = document.querySelectorAll('.sr-issue-row');
+
+  rows.forEach(function(row) {
+    row.addEventListener('click', function() {
+      var targetId = row.getAttribute('data-target');
+      var detailRow = document.getElementById(targetId);
+
+      if (!detailRow) return;
+
+      var isExpanded = detailRow.style.display !== 'none';
+
+      if (isExpanded) {
+        detailRow.style.display = 'none';
+        row.classList.remove('active');
+      } else {
+        detailRow.style.display = 'table-row';
+        row.classList.add('active');
+      }
+    });
+  });
+});
+```
+# END OF FILE: /home/rstudio/repbox/repboxReportSummary/inst/www/sr_report.js
+
+-----------------------------------------------------------
+
+
+
+
+## Format of proposed changes to code or text files
+
+When you suggest changes to code or text files or completely new files, you MUST use the following format for each modification. Each change must be enclosed in a `!MODIFICATION` block.
+
+### Overall Structure
+
+Each modification block has three parts:
+1.  Start and end markers: `!MODIFICATION {{what}}` and `!END_MODIFICATION {{what}}`, where {{what}} is just a short reference to what is modified, file name or function name with with file. It will not be parsed but makes it easier for a human to understand blocks.
+2.  A metadata block in **TOML format**. This block ends with a `---` separator line.
+3.  A code payload block, which is a standard markdown code fence.
+
+```
+!MODIFICATION {{what}}
+# TOML metadata goes here
+# ...
+---
+```language
+# New code payload goes here
+```
+!END_MODIFICATION {{what}}
+```
+
+### Modification Scope
+
+Each modification is of one of the following two scopes:
+
+* `file` (re-)writes a complete file
+
+* `function` (re-)writes a complete function (including comments above).
+
+
+
+If more than two functions or more than two line edits will be performed in the same file, better rewrite the whole file using a `file` scope. For extremely long files also more smaller edits are ok.
+
+Function scope only works for R code files, but in R files it is preferred if one or two functions in a larger file are changed.
+
+The metadata block **MUST** contain a `scope` field, which can be `"file"`, `"function"`, or `"lines"`.
+
+---
+
+### **Scope 1: `file`**
+
+Use this to create a new file or to completely rewrite an existing one.
+
+**Required Fields:**
+*   `scope = "file"`
+*   `file` (string): The path to the file. Very important: state the path of the file as shown in the files header above. If there is a complete absolute path, also show the complete absolute path here.
+*   `description` (string): A brief explanation of the change in quotes ""
+
+#### **Example 1.1: Creating or modifying a file**
+!MODIFICATION new_helpers.R
+scope = "file"
+file = "/home/rstudio/myproject/R/new_helpers.R"
+description = "Create a new file for helper functions."
+---
+```r
+# A new helper function
+say_hello = function(name) {
+  paste0("Hello, ", name)
+}
+```
+!END_MODIFICATION new_helpers.R
+
+
+### **Scope 2: `function`**
+
+Use this to replace an existing function or to insert a new function. The new code payload should contain the complete function, including any preceding comments.
+
+#### **Fields for replacing an existing function:**
+*   `scope = "function"`
+*   `file` (string): The path to the file. Very important: state the path of the file as shown in the files header above. If there is a complete absolute path, also show the complete absolute path here.
+*   `function_name` (string): The name of the function to be replaced.
+*   `description` (string): A brief explanation of the change in quotes.
+
+#### **Fields for inserting a new function:**
+*   `scope = "function"`
+*   `file` (string): The path to the file. Very important: state the path of the file as shown in the files header above. If there is a complete absolute path, also show the complete absolute path here.
+*   `description` (string): A brief explanation of the change, enclose in quotes.
+*   **One of** the following fields to specify the insertion point. They are mutually exclusive.
+    *   `insert_top = true`: Insert at the top of the file.
+    *   `insert_bottom = true`: Insert at the bottom of the file.
+    *   `insert_before_fun = "function_name"`: Insert before the specified function.
+    *   `insert_after_fun = "function_name"`: Insert after the specified function.
+
+
+#### **Example 2.1: Replacing an existing function**
+!MODIFICATION calculate_sum utils.R
+scope = "function"
+file = "R/utils.R"
+function_name = "calculate_sum"
+description = "Update `calculate_sum` to handle NA values correctly.""
+---
+```r
+#' Calculate the sum of a vector, ignoring NAs
+calculate_sum = function(vec) {
+  sum(vec, na.rm = TRUE)
+}
+```
+!END_MODIFICATION calculate_sum utils.R
+
+#### **Example 2.2: Inserting a new function at the bottom of a file (here was an absolute file path given)**
+!MODIFICATION is_positive in R/utils.R
+scope = "function"
+file = "/home/myuser/mypkg/R/utils.R"
+insert_bottom = true
+description = "Add a new helper function to check for positivity."
+---
+```r
+
+#' Check if a number is positive
+is_positive = function(n) {
+  n > 0
+}
+```
+!END_MODIFICATION is_positive in R/utils.R
+
+#### **Example 2.3: Inserting a new function after a specific function**
+!MODIFICATION is_negative in R/utils.R
+scope = "function"
+file = "R/utils.R"
+insert_after_fun = "is_positive"
+description = "Add a new helper function `is_negative` after `is_positive`."
+---
+```r
+
+#' Check if a number is negative
+is_negative = function(n) {
+  n < 0
+}
+```
+!END_MODIFICATION is_negative in R/utils.R
+
+
+# General coding instructions
+
+- For string operations try to use `stringi` functions.
+
+- Try to avoid loops, vectorize if possible.
+
+- Use `=` instead of `<-` as assignment operator.
+
+- Very Important: Do not warp code into `try` statements to generally catch errors.
+  I want that the code fails if there are errors we have not yet understood dealt with.
+  General try catch wrappers will dillude this goal. Existing wrappers are probably
+  ok, but don't add new ones, unless there is really a strong reason to believe that
+  this cleanly solves the underlying problem and does not hide other possible problems.
+
+
+
+
+##################################
+# Your Task
+##################################
+
+Make a file sr_xissues.R that adds xissue suppport to our shiny app. The idea is that I want to systematically describe and store common failure modes that are expected issues (xissues).
+
+1. Make a new pane xissue
+
+2. It shall have a text area field "xissue_yaml_text" where I can write a yaml text to add as an xissue by pressing a button below
+
+3. In xissues.R make a function:
+
+# creates an xissue from yaml text
+# needs to be implemented
+xissue_from_yaml = function(yaml) {
+
+}
+
+4. Below have a table with current xissues. When clicking on an xissue create yaml text in the text field but don't save anything, it is like a template I can modify for a new xissue. 
+
+5. When I click in the issues pane on a project, write an xissue_tpl_last.yaml file into the output dir that is a yaml template for the first issue for the first PID of that error type. E.g. you can extract cmd, failure_cat, etc. Other fields shall be empty quotes, like descr or the search patterns. Fill also "xissue_yaml_text" with it but if xissue_yaml_text also contains a text save it before in a file output_dir/xissue_tpl_old.yaml as a backup
+
+6. When starting the app see if xissue_tpl_last.yaml exists, if yes prefill xissue_yaml_text with it. Otherwise empty.
+
+7. If you have more questions ask, don't just implement the things differently.
+
+Provide the code and explain your changes.
+
+

@@ -9,8 +9,8 @@ Authors@R: c(
       role = c("aut", "cre")
     )
   )
-Description: Summary reports of Stata reproduction across multiple projects
-Depends: repboxDB, repboxUtils, stringi, htmltools
+Description: Summary reports of Stata reproduction across multiple projects using a Shiny Dashboard.
+Depends: repboxDB, repboxUtils, stringi, htmltools, shiny, DT, dplyr, rstudioapi, restorepoint
 License: GPL 3.0
 Encoding: UTF-8
 LazyData: true

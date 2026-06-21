@@ -1,0 +1,4 @@
+Name: Repbox Debug Report
+Description: Repbox Debug Report
+Binding: repbox_debug_report_addin
+Interactive: true
