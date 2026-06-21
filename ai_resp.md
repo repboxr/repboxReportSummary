@@ -1,42 +1,79 @@
-The glitch in the RStudio Viewer pane shown in your screenshot (where the table rows overlap with the footer and disappear) is a known bug with DataTables. When you combine `scrollY` or `scrollX` with `paging = FALSE` inside a narrow/dynamic container (like the Viewer pane or hidden tabs), DataTables splits the header and body into two separate HTML elements and uses JavaScript to calculate their heights. In the Viewer pane, this calculation frequently fails, resulting in a `0px` height body or overlapping content.
+To add `xissue` support to your Shiny app, I have outlined three steps:
+1. Create a new `sr_xissues.R` file to hold the UI pane function and the helper function to generate a YAML template from an issue row.
+2. Modify the `sr_app.R` file to integrate this new pane, render the datatable of current xissues, handle the auto-generation of templates when clicking on a project, manage the backing up of old templates, and implement the initial loading mechanism. 
+3. Inject the `xissue_from_yaml` function at the bottom of the `xissues.R` file.
 
-To make it completely bulletproof and perfectly slim for the viewer:
-1. We will **completely disable** DataTables' built-in JS scrolling (`scrollY` and `scrollX`).
-2. We will wrap the tables in a simple CSS `div` with `max-height: 40vh; overflow: auto;`. This relies on the browser's native scrolling, which *never* fails to render.
-3. We will add a touch of CSS to make the table headers "sticky" so they stay visible when you scroll down natively.
+Here are the detailed modifications.
 
-Here are the modifications:
-
-!MODIFICATION sr_dt_opts in R/sr_utils.R
-scope = "function"
-file = "/home/rstudio/repbox/repboxReportSummary/R/sr_utils.R"
-function_name = "sr_dt_opts"
-description = "Update sr_dt_opts to completely disable DataTables native JS scrolling and rely on simple HTML/CSS for robust rendering in the Viewer pane."
+!MODIFICATION sr_xissues.R
+scope = "file"
+file = "/home/rstudio/repbox/repboxReportSummary/R/sr_xissues.R"
+description = "Create new file for xissue UI and template creation"
 ---
 ```r
-#' Default options for slim DataTables
-#'
-#' @param dom The dom layout string for DataTables.
-#' @param ... Additional options passed to DataTables.
-#' @export
-sr_dt_opts = function(dom = "ft", ...) {
-  list(
-    dom = dom,
-    paging = FALSE,
-    info = FALSE,
-    ordering = TRUE,
-    autoWidth = FALSE,
-    ...
+# UI pane for XIssues
+sr_xissue_pane_ui = function() {
+  shiny::tabPanel("XIssues",
+    shiny::fluidRow(
+      shiny::column(12,
+        shiny::h4("Add / Edit XIssue"),
+        shiny::textAreaInput("xissue_yaml_text", "YAML Text", value = "", rows = 12, width = "100%"),
+        shiny::actionButton("btn_add_xissue", "Add Xissue", class = "btn-primary"),
+        shiny::hr(),
+        shiny::h4("Current XIssues"),
+        shiny::div(class = "table-wrapper", DT::DTOutput("xissues_table"))
+      )
+    )
   )
 }
+
+# Create a YAML template from an issue
+sr_make_xissue_template = function(issue, project) {
+  cmd = if (!is.null(issue$cmd)) issue$cmd else ""
+  if (length(cmd) > 1) cmd = cmd[1]
+  if (is.na(cmd)) cmd = ""
+  
+  pid = if (!is.null(issue$runid)) issue$runid else issue$pid
+  if (is.null(pid)) pid = ""
+  if (length(pid) > 1) pid = pid[1]
+  if (is.na(pid)) pid = ""
+  
+  cat = issue$issue_category
+  if (is.null(cat)) cat = ""
+  if (is.na(cat)) cat = ""
+  
+  failure_cat = ""
+  if (grepl("sb_raw, sb and rb failed", cat)) failure_cat = "sb_raw-sb-rb"
+  else if (grepl("sb and rb failed", cat)) failure_cat = "sb-rb"
+  else if (grepl("rb failed", cat)) failure_cat = "rb"
+  else if (grepl("coefs don't match|coeffs don't match", cat, ignore.case = TRUE)) failure_cat = "coefs"
+  else if (grepl("sb and so coefs", cat)) failure_cat = "so"
+  
+  artid = project
+  if (is.null(artid)) artid = ""
+  
+  li = list(
+    where = "reg",
+    cmd = as.character(cmd),
+    fixed_pattern = "",
+    failure_cat = failure_cat,
+    descr = "",
+    artids = as.character(artid),
+    pids = as.character(pid),
+    time = format(Sys.time()),
+    rx_pattern = ""
+  )
+  
+  yaml::as.yaml(li)
+}
 ```
-!END_MODIFICATION sr_dt_opts in R/sr_utils.R
+!END_MODIFICATION sr_xissues.R
 
 !MODIFICATION sr_app in R/sr_app.R
 scope = "function"
 file = "/home/rstudio/repbox/repboxReportSummary/R/sr_app.R"
 function_name = "sr_app"
-description = "Rewrite sr_app UI to use CSS wrappers for scrolling and update datatable calls to drop scrollY parameters."
+description = "Add XIssues tab and server logic"
 ---
 ```r
 #' Run the interactive Repbox Debugger Shiny App
@@ -77,7 +114,7 @@ sr_app = function(
     shiny::tags$head(
       shiny::tags$style(shiny::HTML("
         body { padding: 5px; }
-        .nav-tabs > li > a { padding: 4px 8px; font-size: 12px; }
+        .nav-tabs > li > a { padding: 2px 4px; font-size: 12px; }
         .dataTables_wrapper { font-size: 12px; }
         .dataTables_filter { margin-bottom: 4px; float: none !important; text-align: left; }
         .dataTables_filter input { padding: 2px; height: auto; }
@@ -93,7 +130,7 @@ sr_app = function(
         .btn-sm { padding: 2px 6px; font-size: 12px; }
         .container-fluid { padding-left: 5px; padding-right: 5px; }
         .col-sm-12 { padding-left: 0; padding-right: 0; }
-        .table-wrapper { max-height: 40vh; overflow: auto; border-bottom: 1px solid #ddd; margin-bottom: 10px; }
+        .table-wrapper { max-height: 40vh; overflow: auto; border-bottom: 1px solid #ddd; margin-bottom: 10px; padding-left: 4px }
       "))
     ),
     shiny::tabsetPanel(
@@ -126,11 +163,40 @@ sr_app = function(
             shiny::div(class = "table-wrapper", DT::DTOutput("prob_detail_table"))
           )
         )
-      )
+      ),
+      
+      # TAB 3: XIssues
+      sr_xissue_pane_ui()
     )
   )
 
   server = function(input, output, session) {
+    sr_get_first_issue_pid = function() {
+      sel = selected_issue_row()
+
+      cur_issues = df_issues %>%
+        dplyr::filter(
+          project_dir == sel$project_dir,
+          issue_category == sel$issue_category
+        )
+
+      id_col = if ("pid" %in% names(cur_issues)) {
+        "pid"
+      } else if ("runid" %in% names(cur_issues)) {
+        "runid"
+      } else {
+        return(NULL)
+      }
+
+      ids = cur_issues[[id_col]]
+      ids = ids[!is.na(ids)]
+
+      if (length(ids) == 0) {
+        return(NULL)
+      }
+
+      ids[[1]]
+    }
 
     # --- Regcheck Issues Logic ---
     summary_data = shiny::reactive({
@@ -172,13 +238,19 @@ sr_app = function(
     output$project_actions = shiny::renderUI({
       req(selected_issue_row())
       shiny::tagList(
-        shiny::div(style = "margin: 5px 0;",
+        shiny::div(style = "margin: 5px 0; padding-left: 4px; !important",
+          shiny::actionButton("btn_study_and_close_issue", "Study and close", class = "btn-sm btn-default"),
           shiny::actionButton("btn_rstudio_issue", "Show in Files", icon = shiny::icon("folder-open"), class = "btn-sm btn-default"),
           shiny::actionButton("btn_report_issue", "do_report.html", icon = shiny::icon("file-code"), class = "btn-sm btn-default")
         )
       )
     })
-
+    shiny::observeEvent(input$btn_study_and_close_issue, {
+      project_dir = selected_issue_row()$project_dir
+      pid = sr_get_first_issue_pid()
+      sr_study_project(project_dir, pid)
+      sr_close_app()
+    })
     shiny::observeEvent(input$btn_rstudio_issue, {
       pdir = selected_issue_row()$project_dir
       try(rstudioapi::filesPaneNavigate(pdir), silent = TRUE)
@@ -281,10 +353,16 @@ sr_app = function(
       req(selected_prob_row())
       shiny::tagList(
         shiny::div(style = "margin: 5px 0;",
-          shiny::actionButton("btn_rstudio_prob", "Show in Files", icon = shiny::icon("folder-open"), class = "btn-sm btn-default"),
-          shiny::actionButton("btn_report_prob", "do_report.html", icon = shiny::icon("file-code"), class = "btn-sm btn-default")
+          shiny::actionButton("btn_study_and_close", "Study and close", class = "btn-sm btn-default"),
+          shiny::actionButton("btn_rstudio_prob", "Files", icon = shiny::icon("folder-open"), class = "btn-sm btn-default"),
+          shiny::actionButton("btn_report_prob", "Report", icon = shiny::icon("file-code"), class = "btn-sm btn-default")
         )
       )
+    })
+    shiny::observeEvent(input$btn_study_and_close, {
+      project_dir = selected_prob_row()$project_dir
+      sr_study_project(project_dir)
+      sr_close_app()
     })
 
     shiny::observeEvent(input$btn_rstudio_prob, {
@@ -320,9 +398,142 @@ sr_app = function(
       )
     })
 
+    # --- XIssues Logic ---
+    xissues_file = xissues_default_file()
+    rxissues = shiny::reactiveVal(data.frame())
+    
+    load_xissues = function() {
+      if (file.exists(xissues_file)) {
+        df = try(readRDS(xissues_file), silent = TRUE)
+        if (!inherits(df, "try-error") && is.data.frame(df)) {
+          rxissues(df)
+        }
+      }
+    }
+    load_xissues()
+    
+    # Load initial yaml template if exists
+    tpl_file = file.path(output_dir, "xissue_tpl_last.yaml")
+    if (file.exists(tpl_file)) {
+      init_yaml = try(paste0(readLines(tpl_file, warn=FALSE), collapse="\n"), silent=TRUE)
+      if (!inherits(init_yaml, "try-error")) {
+        shiny::updateTextAreaInput(session, "xissue_yaml_text", value = init_yaml)
+      }
+    }
+
+    output$xissues_table = DT::renderDT({
+      df = rxissues()
+      if (NROW(df) == 0) return(DT::datatable(data.frame(Message = "No xissues"), options = sr_dt_opts(dom="t")))
+      
+      DT::datatable(
+        df,
+        selection = "single",
+        class = "compact stripe hover",
+        options = sr_dt_opts(dom="ft", paging=TRUE, pageLength=10),
+        rownames = FALSE
+      )
+    })
+    
+    # Click on xissues table -> put into textarea
+    shiny::observeEvent(input$xissues_table_rows_selected, {
+      req(input$xissues_table_rows_selected)
+      df = rxissues()
+      sel = df[input$xissues_table_rows_selected, , drop=FALSE]
+      if (NROW(sel) > 0) {
+        sel$time = format(sel$time)
+        yaml_txt = try(yaml::as.yaml(as.list(sel)), silent=TRUE)
+        if (!inherits(yaml_txt, "try-error")) {
+          shiny::updateTextAreaInput(session, "xissue_yaml_text", value = yaml_txt)
+        }
+      }
+    })
+    
+    # Click add button -> add xissue
+    shiny::observeEvent(input$btn_add_xissue, {
+      yaml_txt = input$xissue_yaml_text
+      if (!nzchar(trimws(yaml_txt))) return()
+      
+      res = try({
+        xissue = xissue_from_yaml(yaml_txt)
+        xissue_add(xissue)
+      }, silent = TRUE)
+      
+      if (inherits(res, "try-error")) {
+        shiny::showNotification(paste0("Error adding xissue: ", as.character(res)), type = "error")
+      } else {
+        shiny::showNotification("Xissue added successfully.", type = "message")
+        load_xissues()
+      }
+    })
+
+    # When clicking an issue row, create template
+    shiny::observeEvent(selected_issue_row(), {
+      sel = selected_issue_row()
+      req(sel)
+      
+      cur_issues = df_issues %>%
+        dplyr::filter(
+          project_dir == sel$project_dir,
+          issue_category == sel$issue_category
+        )
+      if (NROW(cur_issues) == 0) return()
+      
+      first_issue = cur_issues[1, , drop=FALSE]
+      yaml_txt = sr_make_xissue_template(first_issue, sel$project)
+      
+      # Check current text in xissue_yaml_text
+      cur_txt = input$xissue_yaml_text
+      if (is.character(cur_txt) && nzchar(trimws(cur_txt))) {
+        old_file = file.path(output_dir, "xissue_tpl_old.yaml")
+        dir.create(dirname(old_file), showWarnings=FALSE, recursive=TRUE)
+        writeLines(cur_txt, old_file)
+      }
+      
+      tpl_file = file.path(output_dir, "xissue_tpl_last.yaml")
+      dir.create(dirname(tpl_file), showWarnings=FALSE, recursive=TRUE)
+      writeLines(yaml_txt, tpl_file)
+      
+      shiny::updateTextAreaInput(session, "xissue_yaml_text", value = yaml_txt)
+    })
+
   }
 
   shiny::shinyApp(ui, server)
 }
 ```
 !END_MODIFICATION sr_app in R/sr_app.R
+
+
+!MODIFICATION xissue_from_yaml in R/xissues.R
+scope = "function"
+file = "/home/rstudio/repbox/repboxReportSummary/R/xissues.R"
+insert_bottom = true
+description = "Add xissue_from_yaml function"
+---
+```r
+
+xissue_from_yaml = function(yaml) {
+  li = yaml::yaml.load(yaml)
+  if (is.null(li$time)) {
+    li$time = Sys.time()
+  } else if (is.character(li$time)) {
+    li$time = as.POSIXct(li$time)
+  }
+  
+  # Ensure character lengths are 1 for df conversion
+  for (nm in names(li)) {
+    if (length(li[[nm]]) > 1) {
+      li[[nm]] = paste0(li[[nm]], collapse = ",")
+    } else if (length(li[[nm]]) == 0) {
+      li[[nm]] = ""
+    }
+  }
+  
+  xissue = as.data.frame(li, stringsAsFactors = FALSE)
+  if (!xissue$failure_cat %in% xissue_failure_cats()) {
+    stop(paste0("\nNo allowable failure_cat=", xissue$failure_cat))
+  }
+  xissue
+}
+```
+!END_MODIFICATION xissue_from_yaml in R/xissues.R

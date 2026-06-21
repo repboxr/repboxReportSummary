@@ -4,7 +4,7 @@
 # and store them systematically
 
 example = function() {
-  xissue = xissue_make("reg", "ivregress","ivregress liml ","coefs","LIML estimation not yet translated" )
+  xissue = xissue_make("ivregress_liml", "reg", "ivregress","ivregress liml ","coefs","LIML estimation not yet translated" )
   xissue_add(xissue)
   rstudioapi::filesPaneNavigate(dirname(xissues_text_file()))
 }
@@ -15,15 +15,10 @@ xissue_failure_cats = function() {
 }
 
 
-# creates an xissue from yaml text
-# needs to be implemented
-xissue_from_yaml = function(yaml) {
-
-}
 
 # artids: example artids that have the problem
 # pids: example pid that have the problem if there are multiple artid map one-to-one to artid with recycling
-xissue_make = function(where = c("reg", "mod")[1], cmd="", fixed_pattern = "",  failure_cat = "" , descr="", artids="", pids="", time=Sys.time(), rx_pattern="") {
+xissue_make = function(xid="", where = c("reg", "mod")[1], cmd="", fixed_pattern = "",  failure_cat = "" , descr="", artids="", pids="", time=Sys.time(), rx_pattern="") {
   if (length(cmd)>1) {
     cmd = paste0(cmd, collapse=",")
   }
@@ -50,12 +45,17 @@ xissue_add = function(xissue, xissues_file = xissues_default_file(), backup_file
   xi_df = bind_rows(xi_df, xissue)
   dupl = duplicated(xi_df %>% select(-time))
   xi_df = xi_df[!dupl,]
+  xissues_df_save(xi_df, xissues_file, backup_file)
+}
 
+xissues_df_save = function(xi_df,xissues_file = xissues_default_file(), backup_file = xissues_default_backupfile()) {
   try({
     saveRDS(xi_df, xissues_file)
     saveRDS(xi_df, backup_file)
     xissues_as_text(xi_df)
   })
+
+
 }
 
 xissues_as_text = function(xi_df, text_file = xissues_text_file()) {
@@ -71,7 +71,7 @@ xissues_as_text = function(xi_df, text_file = xissues_text_file()) {
 }
 
 xissues_text_file = function() {
-  normalizePath("~/repbox/reports/xissues.txt", mustWork = FALSE)
+  normalizePath("~/repbox/reports/xissues.yaml", mustWork = FALSE)
 }
 
 
@@ -81,4 +81,40 @@ xissues_default_file = function() {
 
 xissues_default_backupfile = function() {
   normalizePath("~/repbox/reports/xissues_backup.Rds", mustWork = FALSE)
+}
+
+example = function() {
+  xi_df = xissues_from_yaml_file()
+  xissues_df_save(xi_df)
+}
+
+xissues_from_yaml_file = function(file = xissues_text_file()) {
+  yaml = readLines(file)
+  li = yaml.load(yaml)
+  res_li = lapply(li, function(raw) do.call(xissue_make, raw))
+  xi_df = bind_rows(res_li)
+}
+
+xissue_from_yaml = function(yaml) {
+  li = yaml::yaml.load(yaml)
+  if (is.null(li$time)) {
+    li$time = Sys.time()
+  } else if (is.character(li$time)) {
+    li$time = as.POSIXct(li$time)
+  }
+
+  # Ensure character lengths are 1 for df conversion
+  for (nm in names(li)) {
+    if (length(li[[nm]]) > 1) {
+      li[[nm]] = paste0(li[[nm]], collapse = ",")
+    } else if (length(li[[nm]]) == 0) {
+      li[[nm]] = ""
+    }
+  }
+
+  xissue = as.data.frame(li, stringsAsFactors = FALSE)
+  if (!xissue$failure_cat %in% xissue_failure_cats()) {
+    stop(paste0("\nNo allowable failure_cat=", xissue$failure_cat))
+  }
+  xissue
 }

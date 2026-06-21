@@ -131,7 +131,10 @@ sr_app = function(
             shiny::div(class = "table-wrapper", DT::DTOutput("prob_detail_table"))
           )
         )
-      )
+      ),
+
+      # TAB 3: XIssues
+      sr_xissue_pane_ui()
     )
   )
 
@@ -214,8 +217,7 @@ sr_app = function(
       project_dir = selected_issue_row()$project_dir
       pid = sr_get_first_issue_pid()
       sr_study_project(project_dir, pid)
-        sr_study_project(project_dir)
-        sr_close_app()
+      sr_close_app()
     })
     shiny::observeEvent(input$btn_rstudio_issue, {
       pdir = selected_issue_row()$project_dir
@@ -362,6 +364,104 @@ sr_app = function(
         options = sr_dt_opts(),
         rownames = FALSE
       )
+    })
+
+    # --- XIssues Logic ---
+    xissues_file = xissues_default_file()
+    rxissues = shiny::reactiveVal(data.frame())
+
+    load_xissues = function() {
+      if (file.exists(xissues_file)) {
+        df = try(readRDS(xissues_file), silent = TRUE)
+        if (!inherits(df, "try-error") && is.data.frame(df)) {
+          rxissues(df)
+        }
+      }
+    }
+    load_xissues()
+
+    # Load initial yaml template if exists
+    tpl_file = file.path(output_dir, "xissue_tpl_last.yaml")
+    if (file.exists(tpl_file)) {
+      init_yaml = try(paste0(readLines(tpl_file, warn=FALSE), collapse="\n"), silent=TRUE)
+      if (!inherits(init_yaml, "try-error")) {
+        shiny::updateTextAreaInput(session, "xissue_yaml_text", value = init_yaml)
+      }
+    }
+
+    output$xissues_table = DT::renderDT({
+      df = rxissues()
+      if (NROW(df) == 0) return(DT::datatable(data.frame(Message = "No xissues"), options = sr_dt_opts(dom="t")))
+
+      DT::datatable(
+        df,
+        selection = "single",
+        class = "compact stripe hover",
+        options = sr_dt_opts(dom="ft", paging=TRUE, pageLength=10),
+        rownames = FALSE
+      )
+    })
+
+    # Click on xissues table -> put into textarea
+    shiny::observeEvent(input$xissues_table_rows_selected, {
+      req(input$xissues_table_rows_selected)
+      df = rxissues()
+      sel = df[input$xissues_table_rows_selected, , drop=FALSE]
+      if (NROW(sel) > 0) {
+        sel$time = format(sel$time)
+        yaml_txt = try(yaml::as.yaml(as.list(sel)), silent=TRUE)
+        if (!inherits(yaml_txt, "try-error")) {
+          shiny::updateTextAreaInput(session, "xissue_yaml_text", value = yaml_txt)
+        }
+      }
+    })
+
+    # Click add button -> add xissue
+    shiny::observeEvent(input$btn_add_xissue, {
+      yaml_txt = input$xissue_yaml_text
+      if (!nzchar(trimws(yaml_txt))) return()
+
+      res = try({
+        xissue = xissue_from_yaml(yaml_txt)
+        xissue_add(xissue)
+      }, silent = TRUE)
+
+      if (inherits(res, "try-error")) {
+        shiny::showNotification(paste0("Error adding xissue: ", as.character(res)), type = "error")
+      } else {
+        shiny::showNotification("Xissue added successfully.", type = "message")
+        load_xissues()
+      }
+    })
+
+    # When clicking an issue row, create template
+    shiny::observeEvent(selected_issue_row(), {
+      sel = selected_issue_row()
+      req(sel)
+
+      cur_issues = df_issues %>%
+        dplyr::filter(
+          project_dir == sel$project_dir,
+          issue_category == sel$issue_category
+        )
+      if (NROW(cur_issues) == 0) return()
+
+      first_issue = cur_issues[1, , drop=FALSE]
+      yaml_txt = sr_make_xissue_template(first_issue, sel$project)
+
+      # Check current text in xissue_yaml_text
+      cur_txt = input$xissue_yaml_text
+      if (is.character(cur_txt) && nzchar(trimws(cur_txt))) {
+        old_file = file.path(output_dir, "xissue_tpl_old.yaml")
+        dir.create(dirname(old_file), showWarnings=FALSE, recursive=TRUE)
+        writeLines(cur_txt, old_file)
+      }
+
+      tpl_file = file.path(output_dir, "xissue_tpl_last.yaml")
+      dir.create(dirname(tpl_file), showWarnings=FALSE, recursive=TRUE)
+      writeLines(yaml_txt, tpl_file)
+
+      shiny::updateTextAreaInput(session, "xissue_yaml_text", value = yaml_txt)
     })
 
   }
