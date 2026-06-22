@@ -98,7 +98,7 @@ sr_app = function(
         .btn-sm { padding: 2px 6px; font-size: 12px; }
         .container-fluid { padding-left: 5px; padding-right: 5px; }
         .col-sm-12 { padding-left: 0; padding-right: 0; }
-        .table-wrapper { max-height: 40vh; overflow: auto; border-bottom: 1px solid #ddd; margin-bottom: 10px; padding-left: 4px }
+        .table-wrapper { max-height: 60vh; overflow: auto; border-bottom: 1px solid #ddd; margin-bottom: 10px; padding-left: 4px }
       "))
     ),
     shiny::tabsetPanel(
@@ -106,15 +106,18 @@ sr_app = function(
       shiny::tabPanel("Regcheck Issues",
         shiny::fluidRow(
           shiny::column(12,
-            shiny::div(class = "table-wrapper", DT::DTOutput("summary_table"))
-          )
-        ),
-        shiny::fluidRow(
-          shiny::column(12,
+            shiny::div(class = "table-wrapper", DT::DTOutput("summary_table")),
+
             shiny::uiOutput("project_actions"),
             shiny::div(class = "table-wrapper", DT::DTOutput("detail_table"))
           )
         )
+        #shiny::fluidRow(
+        #  shiny::column(12,
+        #    shiny::uiOutput("project_actions"),
+        #    shiny::div(class = "table-wrapper", DT::DTOutput("detail_table"))
+        #  )
+        #)
       ),
 
       # TAB 2: Repbox Problems
@@ -249,8 +252,9 @@ sr_app = function(
     })
 
     shiny::observeEvent(input$btn_rstudio_issue, {
-      pdir = selected_issue_row()$project_dir
-      try(rstudioapi::filesPaneNavigate(pdir), silent = TRUE)
+      project_dir = selected_issue_row()$project_dir
+      pid = sr_get_first_issue_pid()
+      sr_study_project(project_dir, pid, open_report = FALSE)
     })
 
     shiny::observeEvent(input$btn_report_issue, {
@@ -513,13 +517,16 @@ sr_close_app = function() {
   shiny::stopApp()
 }
 
-sr_study_project = function(project_dir, pid=NULL) {
+sr_study_project = function(project_dir, pid=NULL, open_report=TRUE) {
   restore.point("sr_study_project")
   .GlobalEnv$project_dir = project_dir
   try(rstudioapi::filesPaneNavigate(file.path(project_dir, "run")))
   try(rstudioapi::navigateToFile(file.path(project_dir, "run/run_test_data_path.R")))
-  rep_file = file.path(project_dir, "reports", "do_report.html")
-  try(utils::browseURL(rep_file), silent = TRUE)
+  if (open_report) {
+    rep_file = file.path(project_dir, "reports", "do_report.html")
+    try(utils::browseURL(rep_file), silent = TRUE)
+
+  }
 
   # Make the Files pane the active RStudio pane.
   try(
