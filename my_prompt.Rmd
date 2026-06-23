@@ -1138,7 +1138,7 @@ sr_app = function(
         .btn-sm { padding: 2px 6px; font-size: 12px; }
         .container-fluid { padding-left: 5px; padding-right: 5px; }
         .col-sm-12 { padding-left: 0; padding-right: 0; }
-        .table-wrapper { max-height: 40vh; overflow: auto; border-bottom: 1px solid #ddd; margin-bottom: 10px; padding-left: 4px }
+        .table-wrapper { max-height: 60vh; overflow: auto; border-bottom: 1px solid #ddd; margin-bottom: 10px; padding-left: 4px }
       "))
     ),
     shiny::tabsetPanel(
@@ -1146,22 +1146,24 @@ sr_app = function(
       shiny::tabPanel("Regcheck Issues",
         shiny::fluidRow(
           shiny::column(12,
-            shiny::div(class = "table-wrapper", DT::DTOutput("summary_table"))
-          )
-        ),
-        shiny::fluidRow(
-          shiny::column(12,
+            shiny::div(class = "table-wrapper", DT::DTOutput("summary_table")),
+
             shiny::uiOutput("project_actions"),
             shiny::div(class = "table-wrapper", DT::DTOutput("detail_table"))
           )
         )
+        #shiny::fluidRow(
+        #  shiny::column(12,
+        #    shiny::uiOutput("project_actions"),
+        #    shiny::div(class = "table-wrapper", DT::DTOutput("detail_table"))
+        #  )
+        #)
       ),
 
       # TAB 2: Repbox Problems
       shiny::tabPanel("Repbox Problems",
         shiny::fluidRow(
           shiny::column(12,
-            shiny::p("Click a row to see detailed instances.", style = "font-size:12px; margin:2px 0; color:#666;"),
             shiny::div(class = "table-wrapper", DT::DTOutput("prob_summary_table"))
           )
         ),
@@ -1235,7 +1237,7 @@ sr_app = function(
       if (NROW(df) == 0) return(data.frame(Message = "No issues found"))
 
       df %>%
-        dplyr::group_by(issue_category, project, project_dir, xid) %>%
+        dplyr::group_by(issue_category, artid, project_dir, xid) %>%
         dplyr::summarize(
           n_issues = dplyr::n(),
           cmd_counts = {
@@ -1258,7 +1260,7 @@ sr_app = function(
       if ("Message" %in% names(df)) return(DT::datatable(df, class = "compact stripe hover", options = sr_dt_opts(dom="t")))
 
       DT::datatable(
-        df %>% dplyr::select(Category = issue_category, Project = project, Issues = n_issues, Commands = cmd_counts, XID = xid),
+        df %>% dplyr::select(Category = issue_category, ArtID = artid, Issues = n_issues, Commands = cmd_counts, XID = xid),
         selection = "single",
         class = "compact stripe hover",
         options = sr_dt_opts(),
@@ -1290,8 +1292,9 @@ sr_app = function(
     })
 
     shiny::observeEvent(input$btn_rstudio_issue, {
-      pdir = selected_issue_row()$project_dir
-      try(rstudioapi::filesPaneNavigate(pdir), silent = TRUE)
+      project_dir = selected_issue_row()$project_dir
+      pid = sr_get_first_issue_pid()
+      sr_study_project(project_dir, pid, open_report = FALSE)
     })
 
     shiny::observeEvent(input$btn_report_issue, {
@@ -1310,7 +1313,7 @@ sr_app = function(
 
       cur_issues = issues_with_xid() %>%
         dplyr::filter(
-          project == sel$project,
+          artid == sel$artid,
           issue_category == sel$issue_category,
           xid == sel$xid
         )
@@ -1365,7 +1368,7 @@ sr_app = function(
       if (NROW(df_probs) == 0) return(data.frame(Message = "No repbox_problems found"))
 
       df_probs %>%
-        dplyr::group_by(type, project, project_dir) %>%
+        dplyr::group_by(problem_type, artid, project_dir) %>%
         dplyr::summarize(
           n_problems = dplyr::n(),
           .groups = "drop"
@@ -1378,7 +1381,7 @@ sr_app = function(
       if ("Message" %in% names(df)) return(DT::datatable(df, class = "compact stripe hover", options = sr_dt_opts(dom="t")))
 
       DT::datatable(
-        df %>% dplyr::select(Type = type, Project = project, Count = n_problems),
+        df %>% dplyr::select(Type = problem_type, ArtID = artid, Count = n_problems),
         selection = "single",
         class = "compact stripe hover",
         options = sr_dt_opts(),
@@ -1427,9 +1430,9 @@ sr_app = function(
       sel = selected_prob_row()
 
       cur_probs = df_probs %>%
-        dplyr::filter(project == sel$project, type == sel$type)
+        dplyr::filter(artid == sel$artid, problem_type == sel$problem_type)
 
-      show_cols = intersect(names(cur_probs), c("runid", "type", "msg", "fail_action", "file", "line"))
+      show_cols = intersect(names(cur_probs), c("runid", "pid", "problem_type", "problem_descr", "file", "line"))
       out_df = cur_probs %>% dplyr::select(dplyr::any_of(show_cols))
 
       DT::datatable(
@@ -1525,16 +1528,16 @@ sr_app = function(
           xi$time = format(xi$time)
           yaml_txt = try(yaml::as.yaml(as.list(xi[1, ])), silent=TRUE)
           if (inherits(yaml_txt, "try-error")) {
-            yaml_txt = sr_make_xissue_template(cur_issues[1, , drop=FALSE], sel$project)
+            yaml_txt = sr_make_xissue_template(cur_issues[1, , drop=FALSE], sel$artid)
           }
         } else {
           # Fallback
-          yaml_txt = sr_make_xissue_template(cur_issues[1, , drop=FALSE], sel$project)
+          yaml_txt = sr_make_xissue_template(cur_issues[1, , drop=FALSE], sel$artid)
         }
       } else {
         # Create a blank new template to fill out
         first_issue = cur_issues[1, , drop=FALSE]
-        yaml_txt = sr_make_xissue_template(first_issue, sel$project)
+        yaml_txt = sr_make_xissue_template(first_issue, sel$artid)
       }
 
       tpl_file = file.path(output_dir, "xissue_tpl_last.yaml")
@@ -1554,13 +1557,16 @@ sr_close_app = function() {
   shiny::stopApp()
 }
 
-sr_study_project = function(project_dir, pid=NULL) {
+sr_study_project = function(project_dir, pid=NULL, open_report=TRUE) {
   restore.point("sr_study_project")
   .GlobalEnv$project_dir = project_dir
   try(rstudioapi::filesPaneNavigate(file.path(project_dir, "run")))
   try(rstudioapi::navigateToFile(file.path(project_dir, "run/run_test_data_path.R")))
-  rep_file = file.path(project_dir, "reports", "do_report.html")
-  try(utils::browseURL(rep_file), silent = TRUE)
+  if (open_report) {
+    rep_file = file.path(project_dir, "reports", "do_report.html")
+    try(utils::browseURL(rep_file), silent = TRUE)
+
+  }
 
   # Make the Files pane the active RStudio pane.
   try(
@@ -1677,7 +1683,9 @@ sr_get_project_issues = function(project_dir, parcels=list()) {
   cat[mask1] = "1. sb_raw, sb and rb failed but so exists"
 
   df_rc$issue_category = cat
-  df_rc$project = basename(project_dir)
+  if (!"artid" %in% names(df_rc)) {
+    df_rc$artid = basename(project_dir)
+  }
   df_rc$project_dir = project_dir
 
   # Filter only actual issues
@@ -1699,12 +1707,14 @@ sr_get_project_problems = function(project_dir) {
   if (is.null(probs) || NROW(probs) == 0) return(NULL)
 
   df_prob = as.data.frame(probs)
-  df_prob$project = basename(project_dir)
+  if (!"artid" %in% names(df_prob)) {
+    df_prob$artid = basename(project_dir)
+  }
   df_prob$project_dir = project_dir
 
   # ignore some problems that are unimportant
 
-  df_prob = filter(df_prob, !stri_detect_fixed(df_prob$problem_type,"_journ_"))
+  df_prob = dplyr::filter(df_prob, !stringi::stri_detect_fixed(df_prob$problem_type,"_journ_"))
   df_prob
 }
 ```
@@ -2060,6 +2070,8 @@ xissue_add = function(xissue, xissues_file = xissues_default_file(), backup_file
     xi_df = NULL
   }
 
+  xi_df$time = as.POSIXct(xi_df$time)
+
   if (!is.null(xi_df) && nrow(xi_df) > 0 && xissue$xid %in% xi_df$xid) {
     # Replace existing xissue with same xid
     idx = which(xi_df$xid == xissue$xid)
@@ -2127,11 +2139,7 @@ xissues_from_yaml_file = function(file = xissues_text_file()) {
 
 xissue_from_yaml = function(yaml) {
   li = yaml::yaml.load(yaml)
-  if (is.null(li$time)) {
-    li$time = Sys.time()
-  } else if (is.character(li$time)) {
-    li$time = as.POSIXct(li$time)
-  }
+  li$time = Sys.time()
 
   # Ensure character lengths are 1 for df conversion
   for (nm in names(li)) {
@@ -2510,43 +2518,13 @@ is_negative = function(n) {
 # Your Task
 ##################################
 
+Please implement a new feature. When clicking on an article in the issue tab and details are shown please add another button on the right with label "Set low priority".
 
-The written code probably did not know actual structure of the problem data frame. Here is how it looks (an example):
+In the same output folder where xissue files are stored generate a text file low_priority_issues_artid.txt. It shall contain the artid of articles whose issues are marked as low priority. Issues of a low priority article shall be sorted to the bottom of the issue list. Idea is that these are not xissues but smaller issues, I won't handle now. It is ok to mark complete articles even if there are different issue classes, practically I will always check complete articles. 
 
->   df_prob
-         artid    problem_type
-1 aejapp_1_2_4 regvar_no_match
-2 aejapp_1_2_4 regvar_no_match
-3 aejapp_1_2_4 regvar_no_match
-4 aejapp_1_2_4 regvar_no_match
-5 aejapp_1_2_4           error
-6 aejapp_1_2_4           error
-7 aejapp_1_2_4           error
-                                                                                                                                                                problem_descr
-1                                                                                    The regression variable rgiv_hat could not be matched with any variable in the data set.
-2                                                                                    Column rgiv_hat does not exist in data set and thus I cannot generate the cterm rgiv_hat
-3                                                                                  The regression variable giving_hat could not be matched with any variable in the data set.
-4                                                                                Column giving_hat does not exist in data set and thus I cannot generate the cterm giving_hat
-5                                                  mrb_run_r_base_step: Error: Column giving_hat does not exist in data set and thus I cannot generate the cterm giving_hat\n
-6                                                      mrb_run_r_base_step: Error: Column rgiv_hat does not exist in data set and thus I cannot generate the cterm rgiv_hat\n
-7 mrb_run_r_base_step: Error in repboxDRF::drf_get_data(pid, drf = mrb$drf, filtered = FALSE, : No R code found for getting data and no cache found. That looks like a bug.\n
-       project                                project_dir
-1 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
-2 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
-3 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
-4 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
-5 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
-6 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
-7 aejapp_1_2_4 /home/rstudio/repbox/projects/aejapp_1_2_4
+If a low priority article is opened show a button "Set normal priority" that allows to remove it from the low priority list.
 
-Curently when goin to the problem tab there is currently an error:
-
-Listening on http://127.0.0.1:3345
-Warning: Error in dplyr::group_by: Must group by variables found in `.data`.
-✖ Column `type` is not found.
-  132: <Anonymous>
-Input to asJSON(keep_vec_names=TRUE) is a named vector. In a future version of jsonlite, this option will not be supported, and named vectors will be translated into arrays instead of objects. If you want JSON object output, please use a named list instead. See ?toJSON.
+Describe your changes.
 
 
-Can you explain and fix? Maybe we don't even need to generate the "project" field. Convention is that it is called artid.
 

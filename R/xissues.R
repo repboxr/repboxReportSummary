@@ -47,6 +47,8 @@ xissue_add = function(xissue, xissues_file = xissues_default_file(), backup_file
     xi_df = NULL
   }
 
+  xi_df$time = as.POSIXct(xi_df$time)
+
   if (!is.null(xi_df) && nrow(xi_df) > 0 && xissue$xid %in% xi_df$xid) {
     # Replace existing xissue with same xid
     idx = which(xi_df$xid == xissue$xid)
@@ -114,11 +116,7 @@ xissues_from_yaml_file = function(file = xissues_text_file()) {
 
 xissue_from_yaml = function(yaml) {
   li = yaml::yaml.load(yaml)
-  if (is.null(li$time)) {
-    li$time = Sys.time()
-  } else if (is.character(li$time)) {
-    li$time = as.POSIXct(li$time)
-  }
+  li$time = Sys.time()
 
   # Ensure character lengths are 1 for df conversion
   for (nm in names(li)) {

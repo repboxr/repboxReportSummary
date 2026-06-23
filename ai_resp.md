@@ -1,14 +1,12 @@
-The error you encountered is because the DataFrame `df_probs` doesn't contain a `type` column or a `project` column. Instead, based on your data output, the columns are `problem_type` and `artid`. 
+To implement the "low priority" feature, we will modify the main `sr_app` function in `R/sr_app.R`. We will add a new reactive value to track low-priority `artid`s, load them from `low_priority_issues_artid.txt`, update the summary tables to sort low-priority items at the bottom, and include the toggling buttons in both the Regcheck Issues and Repbox Problems tabs.
 
-We'll replace all usages of `type` with `problem_type`, replace usages of `project` with `artid`, and make sure we display `problem_descr` in the detail table (instead of `msg`). 
+Here is the modification for the `sr_app.R` file:
 
-Here are the required fixes:
-
-!MODIFICATION sr_app sr_app.R
+!MODIFICATION sr_app in sr_app.R
 scope = "function"
 file = "/home/rstudio/repbox/repboxReportSummary/R/sr_app.R"
 function_name = "sr_app"
-description = "Fix error by grouping by problem_type and replacing project with artid"
+description = "Add low priority article toggle, sorting, and persistence for Regcheck Issues and Repbox Problems."
 ---
 ```r
 #' Run the interactive Repbox Debugger Shiny App
@@ -65,7 +63,7 @@ sr_app = function(
         .btn-sm { padding: 2px 6px; font-size: 12px; }
         .container-fluid { padding-left: 5px; padding-right: 5px; }
         .col-sm-12 { padding-left: 0; padding-right: 0; }
-        .table-wrapper { max-height: 40vh; overflow: auto; border-bottom: 1px solid #ddd; margin-bottom: 10px; padding-left: 4px }
+        .table-wrapper { max-height: 60vh; overflow: auto; border-bottom: 1px solid #ddd; margin-bottom: 10px; padding-left: 4px }
       "))
     ),
     shiny::tabsetPanel(
@@ -73,11 +71,8 @@ sr_app = function(
       shiny::tabPanel("Regcheck Issues",
         shiny::fluidRow(
           shiny::column(12,
-            shiny::div(class = "table-wrapper", DT::DTOutput("summary_table"))
-          )
-        ),
-        shiny::fluidRow(
-          shiny::column(12,
+            shiny::div(class = "table-wrapper", DT::DTOutput("summary_table")),
+
             shiny::uiOutput("project_actions"),
             shiny::div(class = "table-wrapper", DT::DTOutput("detail_table"))
           )
@@ -88,7 +83,6 @@ sr_app = function(
       shiny::tabPanel("Repbox Problems",
         shiny::fluidRow(
           shiny::column(12,
-            shiny::p("Click a row to see detailed instances.", style = "font-size:12px; margin:2px 0; color:#666;"),
             shiny::div(class = "table-wrapper", DT::DTOutput("prob_summary_table"))
           )
         ),
@@ -120,6 +114,20 @@ sr_app = function(
       }
     }
     load_xissues()
+    
+    # Load low priority artids
+    low_priority_file = file.path(output_dir, "low_priority_issues_artid.txt")
+    low_priority_artids = shiny::reactiveVal(character())
+
+    load_low_priority = function() {
+      if (file.exists(low_priority_file)) {
+        artids = try(readLines(low_priority_file, warn = FALSE), silent = TRUE)
+        if (!inherits(artids, "try-error")) {
+          low_priority_artids(artids[nzchar(artids)])
+        }
+      }
+    }
+    load_low_priority()
 
     # Match static raw df_issues to currently active xissues
     issues_with_xid = shiny::reactive({
@@ -160,6 +168,8 @@ sr_app = function(
     summary_data = shiny::reactive({
       df = issues_with_xid()
       if (NROW(df) == 0) return(data.frame(Message = "No issues found"))
+      
+      low_artids = low_priority_artids()
 
       df %>%
         dplyr::group_by(issue_category, artid, project_dir, xid) %>%
@@ -173,7 +183,9 @@ sr_app = function(
           },
           .groups = "drop"
         ) %>%
+        dplyr::mutate(is_low_priority = artid %in% low_artids) %>%
         dplyr::arrange(
+          is_low_priority,
           nzchar(xid), # nzchar == FALSE (0) -> ordered first, matched ones later
           issue_category,
           dplyr::desc(n_issues)
@@ -200,11 +212,21 @@ sr_app = function(
 
     output$project_actions = shiny::renderUI({
       req(selected_issue_row())
+      sel = selected_issue_row()
+      
+      is_low = sel$artid %in% low_priority_artids()
+      btn_priority = if (is_low) {
+        shiny::actionButton("btn_set_normal_priority", "Set normal priority", class = "btn-sm btn-info", style="margin-left:15px;")
+      } else {
+        shiny::actionButton("btn_set_low_priority", "Set low priority", class = "btn-sm btn-warning", style="margin-left:15px;")
+      }
+      
       shiny::tagList(
         shiny::div(style = "margin: 5px 0; padding-left: 4px; !important",
           shiny::actionButton("btn_study_and_close_issue", "Study and close", class = "btn-sm btn-default"),
           shiny::actionButton("btn_rstudio_issue", "Show in Files", icon = shiny::icon("folder-open"), class = "btn-sm btn-default"),
-          shiny::actionButton("btn_report_issue", "do_report.html", icon = shiny::icon("file-code"), class = "btn-sm btn-default")
+          shiny::actionButton("btn_report_issue", "do_report.html", icon = shiny::icon("file-code"), class = "btn-sm btn-default"),
+          btn_priority
         )
       )
     })
@@ -217,8 +239,9 @@ sr_app = function(
     })
 
     shiny::observeEvent(input$btn_rstudio_issue, {
-      pdir = selected_issue_row()$project_dir
-      try(rstudioapi::filesPaneNavigate(pdir), silent = TRUE)
+      project_dir = selected_issue_row()$project_dir
+      pid = sr_get_first_issue_pid()
+      sr_study_project(project_dir, pid, open_report = FALSE)
     })
 
     shiny::observeEvent(input$btn_report_issue, {
@@ -228,6 +251,30 @@ sr_app = function(
         try(utils::browseURL(rep_file), silent = TRUE)
       } else {
         shiny::showNotification("do_report.html not found in project.", type = "warning")
+      }
+    })
+    
+    shiny::observeEvent(input$btn_set_low_priority, {
+      req(selected_issue_row())
+      artid = selected_issue_row()$artid
+      cur = low_priority_artids()
+      if (!(artid %in% cur)) {
+        new_list = c(cur, artid)
+        low_priority_artids(new_list)
+        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
+        writeLines(new_list, low_priority_file)
+      }
+    })
+
+    shiny::observeEvent(input$btn_set_normal_priority, {
+      req(selected_issue_row())
+      artid = selected_issue_row()$artid
+      cur = low_priority_artids()
+      if (artid %in% cur) {
+        new_list = setdiff(cur, artid)
+        low_priority_artids(new_list)
+        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
+        writeLines(new_list, low_priority_file)
       }
     })
 
@@ -290,6 +337,8 @@ sr_app = function(
     # --- Repbox Problems Logic ---
     prob_summary_data = shiny::reactive({
       if (NROW(df_probs) == 0) return(data.frame(Message = "No repbox_problems found"))
+      
+      low_artids = low_priority_artids()
 
       df_probs %>%
         dplyr::group_by(problem_type, artid, project_dir) %>%
@@ -297,7 +346,8 @@ sr_app = function(
           n_problems = dplyr::n(),
           .groups = "drop"
         ) %>%
-        dplyr::arrange(dplyr::desc(n_problems))
+        dplyr::mutate(is_low_priority = artid %in% low_artids) %>%
+        dplyr::arrange(is_low_priority, dplyr::desc(n_problems))
     })
 
     output$prob_summary_table = DT::renderDT({
@@ -320,14 +370,49 @@ sr_app = function(
 
     output$prob_project_actions = shiny::renderUI({
       req(selected_prob_row())
+      sel = selected_prob_row()
+      
+      is_low = sel$artid %in% low_priority_artids()
+      btn_priority = if (is_low) {
+        shiny::actionButton("btn_set_normal_priority_prob", "Set normal priority", class = "btn-sm btn-info", style="margin-left:15px;")
+      } else {
+        shiny::actionButton("btn_set_low_priority_prob", "Set low priority", class = "btn-sm btn-warning", style="margin-left:15px;")
+      }
+      
       shiny::tagList(
         shiny::div(style = "margin: 5px 0;",
           shiny::actionButton("btn_study_and_close", "Study and close", class = "btn-sm btn-default"),
           shiny::actionButton("btn_rstudio_prob", "Files", icon = shiny::icon("folder-open"), class = "btn-sm btn-default"),
-          shiny::actionButton("btn_report_prob", "Report", icon = shiny::icon("file-code"), class = "btn-sm btn-default")
+          shiny::actionButton("btn_report_prob", "Report", icon = shiny::icon("file-code"), class = "btn-sm btn-default"),
+          btn_priority
         )
       )
     })
+    
+    shiny::observeEvent(input$btn_set_low_priority_prob, {
+      req(selected_prob_row())
+      artid = selected_prob_row()$artid
+      cur = low_priority_artids()
+      if (!(artid %in% cur)) {
+        new_list = c(cur, artid)
+        low_priority_artids(new_list)
+        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
+        writeLines(new_list, low_priority_file)
+      }
+    })
+
+    shiny::observeEvent(input$btn_set_normal_priority_prob, {
+      req(selected_prob_row())
+      artid = selected_prob_row()$artid
+      cur = low_priority_artids()
+      if (artid %in% cur) {
+        new_list = setdiff(cur, artid)
+        low_priority_artids(new_list)
+        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
+        writeLines(new_list, low_priority_file)
+      }
+    })
+
     shiny::observeEvent(input$btn_study_and_close, {
       project_dir = selected_prob_row()$project_dir
       sr_study_project(project_dir)
@@ -476,114 +561,4 @@ sr_app = function(
   shiny::shinyApp(ui, server)
 }
 ```
-!END_MODIFICATION sr_app sr_app.R
-
-!MODIFICATION sr_get_project_issues sr_data.R
-scope = "function"
-file = "/home/rstudio/repbox/repboxReportSummary/R/sr_data.R"
-function_name = "sr_get_project_issues"
-description = "Use artid instead of project."
----
-```r
-#' Get and categorize issues for a single project based on fine-tuned categories
-sr_get_project_issues = function(project_dir, parcels=list()) {
-  restore.point("sr_get_project_issues")
-  library(repboxDB)
-
-  parcels = repdb_load_parcels(project_dir,c("regcheck", "reg"))
-  regcheck = parcels$regcheck
-  reg = parcels$reg
-  if (is.null(regcheck) || NROW(regcheck) == 0) return(NULL)
-  df_rc = as.data.frame(regcheck)
-  df_rc = left_join(df_rc, reg %>% select(runid, cmd, cmdline), by="runid") %>%
-    mutate(line=NA, file_path=NA)
-
-  # Check if run worked
-  reg_ok = sr_v_bool(df_rc$reg_ok, FALSE)
-
-  # Identify variables safely
-  so_exists = sr_v_bool(df_rc$so_raw_did_run, FALSE) | sr_v_bool(df_rc$so_did_run, FALSE)
-  sb_raw_exists = sr_v_bool(df_rc$sb_raw_did_run, FALSE)
-  sb_failed = !sr_v_bool(df_rc$sb_did_run, FALSE)
-  rb_failed = !sr_v_bool(df_rc$rb_did_run, FALSE)
-
-  sb_so_diff = !sr_v_bool(df_rc$sb_so_identical, TRUE)
-  share_same = sr_v_num(df_rc$rb_sb_share_coeff_same, 1)
-  coef_mismatch_share = 1 - share_same
-
-  cmd_col = tolower(as.character(df_rc$cmd))
-  cmd_col[is.na(cmd_col)] = ""
-  is_logit_probit = grepl("logit|probit", cmd_col)
-
-  cat = rep("8. Other issues", NROW(df_rc))
-
-  # 1. sb_raw, sb and rb failed but so exists
-  mask1 = !sb_raw_exists & sb_failed & rb_failed & so_exists
-  # 2. sb and rb failed but sb_raw exists
-  mask2 = sb_raw_exists & sb_failed & rb_failed
-  # 3. rb failed
-  mask3 = !mask1 & !mask2 & rb_failed
-  # 4. > 20% coeffs don't match between sb and rb and not a logit or probit command
-  mask4 = !rb_failed & (coef_mismatch_share > 0.2) & !is_logit_probit
-  # 5. sb and so coefs don't match
-  mask5 = !rb_failed & !mask4 & sb_so_diff
-  # 6. < 20% coeffs don't match (i.e. > 0 and <= 0.2)
-  mask6 = !rb_failed & !mask4 & !mask5 & (coef_mismatch_share > 0 & coef_mismatch_share <= 0.2) & !is_logit_probit
-  # 7. coefs don't match but logit or probit
-  mask7 = !rb_failed & (coef_mismatch_share > 0) & is_logit_probit
-
-  # Apply masks to category (later masks overwrite earlier ones if overlapping, though constructed to be mostly exclusive)
-  cat[mask7] = "7. Coefs don't match but logit/probit"
-  cat[mask6] = "6. < 20% coeffs don't match"
-  cat[mask5] = "5. sb and so coefs don't match"
-  cat[mask4] = "4. > 20% coeffs don't match (not logit/probit)"
-  cat[mask3] = "3. rb failed"
-  cat[mask2] = "2. sb and rb failed but sb_raw exists"
-  cat[mask1] = "1. sb_raw, sb and rb failed but so exists"
-
-  df_rc$issue_category = cat
-  if (!"artid" %in% names(df_rc)) {
-    df_rc$artid = basename(project_dir)
-  }
-  df_rc$project_dir = project_dir
-
-  # Filter only actual issues
-  is_issue = !reg_ok | (cat != "8. Other issues") | (!is.na(df_rc$problem) & nzchar(as.character(df_rc$problem)))
-  df_rc = df_rc[is_issue, , drop = FALSE]
-
-  if (NROW(df_rc) == 0) return(NULL)
-
-  df_rc
-}
-```
-!END_MODIFICATION sr_get_project_issues sr_data.R
-
-!MODIFICATION sr_get_project_problems sr_data.R
-scope = "function"
-file = "/home/rstudio/repbox/repboxReportSummary/R/sr_data.R"
-function_name = "sr_get_project_problems"
-description = "Use artid, do not generate project field. Filter out journ problems."
----
-```r
-#' Get repbox_problems for a single project
-sr_get_project_problems = function(project_dir) {
-  restore.point("sr_get_project_problems")
-  if (!repdb_has_parcel(project_dir, "problem")) {
-    repboxRun::repbox_store_project_problems(project_dir = project_dir)
-  }
-  probs = repdb_load_parcels(project_dir, "problem")$problem
-  if (is.null(probs) || NROW(probs) == 0) return(NULL)
-
-  df_prob = as.data.frame(probs)
-  if (!"artid" %in% names(df_prob)) {
-    df_prob$artid = basename(project_dir)
-  }
-  df_prob$project_dir = project_dir
-
-  # ignore some problems that are unimportant
-
-  df_prob = dplyr::filter(df_prob, !stringi::stri_detect_fixed(df_prob$problem_type,"_journ_"))
-  df_prob
-}
-```
-!END_MODIFICATION sr_get_project_problems sr_data.R
+!END_MODIFICATION sr_app in sr_app.R

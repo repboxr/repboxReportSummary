@@ -112,12 +112,6 @@ sr_app = function(
             shiny::div(class = "table-wrapper", DT::DTOutput("detail_table"))
           )
         )
-        #shiny::fluidRow(
-        #  shiny::column(12,
-        #    shiny::uiOutput("project_actions"),
-        #    shiny::div(class = "table-wrapper", DT::DTOutput("detail_table"))
-        #  )
-        #)
       ),
 
       # TAB 2: Repbox Problems
@@ -155,6 +149,20 @@ sr_app = function(
       }
     }
     load_xissues()
+
+    # Load low priority artids
+    low_priority_file = file.path(output_dir, "low_priority_issues_artid.txt")
+    low_priority_artids = shiny::reactiveVal(character())
+
+    load_low_priority = function() {
+      if (file.exists(low_priority_file)) {
+        artids = try(readLines(low_priority_file, warn = FALSE), silent = TRUE)
+        if (!inherits(artids, "try-error")) {
+          low_priority_artids(artids[nzchar(artids)])
+        }
+      }
+    }
+    load_low_priority()
 
     # Match static raw df_issues to currently active xissues
     issues_with_xid = shiny::reactive({
@@ -196,6 +204,8 @@ sr_app = function(
       df = issues_with_xid()
       if (NROW(df) == 0) return(data.frame(Message = "No issues found"))
 
+      low_artids = low_priority_artids()
+
       df %>%
         dplyr::group_by(issue_category, artid, project_dir, xid) %>%
         dplyr::summarize(
@@ -208,7 +218,9 @@ sr_app = function(
           },
           .groups = "drop"
         ) %>%
+        dplyr::mutate(is_low_priority = artid %in% low_artids) %>%
         dplyr::arrange(
+          is_low_priority,
           nzchar(xid), # nzchar == FALSE (0) -> ordered first, matched ones later
           issue_category,
           dplyr::desc(n_issues)
@@ -235,11 +247,21 @@ sr_app = function(
 
     output$project_actions = shiny::renderUI({
       req(selected_issue_row())
+      sel = selected_issue_row()
+
+      is_low = sel$artid %in% low_priority_artids()
+      btn_priority = if (is_low) {
+        shiny::actionButton("btn_set_normal_priority", "Set normal priority", class = "btn-sm btn-info", style="margin-left:15px;")
+      } else {
+        shiny::actionButton("btn_set_low_priority", "Set low priority", class = "btn-sm btn-default", style="margin-left:15px;")
+      }
+
       shiny::tagList(
         shiny::div(style = "margin: 5px 0; padding-left: 4px; !important",
           shiny::actionButton("btn_study_and_close_issue", "Study and close", class = "btn-sm btn-default"),
           shiny::actionButton("btn_rstudio_issue", "Show in Files", icon = shiny::icon("folder-open"), class = "btn-sm btn-default"),
-          shiny::actionButton("btn_report_issue", "do_report.html", icon = shiny::icon("file-code"), class = "btn-sm btn-default")
+          shiny::actionButton("btn_report_issue", "do_report.html", icon = shiny::icon("file-code"), class = "btn-sm btn-default"),
+          btn_priority
         )
       )
     })
@@ -264,6 +286,30 @@ sr_app = function(
         try(utils::browseURL(rep_file), silent = TRUE)
       } else {
         shiny::showNotification("do_report.html not found in project.", type = "warning")
+      }
+    })
+
+    shiny::observeEvent(input$btn_set_low_priority, {
+      req(selected_issue_row())
+      artid = selected_issue_row()$artid
+      cur = low_priority_artids()
+      if (!(artid %in% cur)) {
+        new_list = c(cur, artid)
+        low_priority_artids(new_list)
+        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
+        writeLines(new_list, low_priority_file)
+      }
+    })
+
+    shiny::observeEvent(input$btn_set_normal_priority, {
+      req(selected_issue_row())
+      artid = selected_issue_row()$artid
+      cur = low_priority_artids()
+      if (artid %in% cur) {
+        new_list = setdiff(cur, artid)
+        low_priority_artids(new_list)
+        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
+        writeLines(new_list, low_priority_file)
       }
     })
 
@@ -327,13 +373,16 @@ sr_app = function(
     prob_summary_data = shiny::reactive({
       if (NROW(df_probs) == 0) return(data.frame(Message = "No repbox_problems found"))
 
+      low_artids = low_priority_artids()
+
       df_probs %>%
         dplyr::group_by(problem_type, artid, project_dir) %>%
         dplyr::summarize(
           n_problems = dplyr::n(),
           .groups = "drop"
         ) %>%
-        dplyr::arrange(dplyr::desc(n_problems))
+        dplyr::mutate(is_low_priority = artid %in% low_artids) %>%
+        dplyr::arrange(is_low_priority, dplyr::desc(n_problems))
     })
 
     output$prob_summary_table = DT::renderDT({
@@ -356,14 +405,49 @@ sr_app = function(
 
     output$prob_project_actions = shiny::renderUI({
       req(selected_prob_row())
+      sel = selected_prob_row()
+
+      is_low = sel$artid %in% low_priority_artids()
+      btn_priority = if (is_low) {
+        shiny::actionButton("btn_set_normal_priority_prob", "Set normal priority", class = "btn-sm btn-info", style="margin-left:15px;")
+      } else {
+        shiny::actionButton("btn_set_low_priority_prob", "Set low priority", class = "btn-sm btn-warning", style="margin-left:15px;")
+      }
+
       shiny::tagList(
         shiny::div(style = "margin: 5px 0;",
           shiny::actionButton("btn_study_and_close", "Study and close", class = "btn-sm btn-default"),
           shiny::actionButton("btn_rstudio_prob", "Files", icon = shiny::icon("folder-open"), class = "btn-sm btn-default"),
-          shiny::actionButton("btn_report_prob", "Report", icon = shiny::icon("file-code"), class = "btn-sm btn-default")
+          shiny::actionButton("btn_report_prob", "Report", icon = shiny::icon("file-code"), class = "btn-sm btn-default"),
+          btn_priority
         )
       )
     })
+
+    shiny::observeEvent(input$btn_set_low_priority_prob, {
+      req(selected_prob_row())
+      artid = selected_prob_row()$artid
+      cur = low_priority_artids()
+      if (!(artid %in% cur)) {
+        new_list = c(cur, artid)
+        low_priority_artids(new_list)
+        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
+        writeLines(new_list, low_priority_file)
+      }
+    })
+
+    shiny::observeEvent(input$btn_set_normal_priority_prob, {
+      req(selected_prob_row())
+      artid = selected_prob_row()$artid
+      cur = low_priority_artids()
+      if (artid %in% cur) {
+        new_list = setdiff(cur, artid)
+        low_priority_artids(new_list)
+        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
+        writeLines(new_list, low_priority_file)
+      }
+    })
+
     shiny::observeEvent(input$btn_study_and_close, {
       project_dir = selected_prob_row()$project_dir
       sr_study_project(project_dir)
