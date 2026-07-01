@@ -13,13 +13,15 @@ sr_xissue_pane_ui = function() {
 }
 
 # Map issue category strings consistently to short failure categories
+# Map issue category strings consistently to short failure categories
 sr_issue_to_failure_cat = function(cat) {
   restore.point("sr_issue_to_failure_cat")
   if (is.null(cat) || length(cat) == 0) return(character(0))
   cat[is.na(cat)] = ""
 
   failure_cat = rep("", length(cat))
-  failure_cat[grepl("sb_raw, sb and rb failed", cat)] = "sb_raw-sb-rb"
+  failure_cat[grepl("TIMEOUT", cat)] = "timeout"
+  failure_cat[grepl("sb_raw, sb and rb failed", cat) & failure_cat == ""] = "sb_raw-sb-rb"
   failure_cat[grepl("sb and rb failed", cat) & failure_cat == ""] = "sb-rb"
   failure_cat[grepl("rb failed", cat) & failure_cat == ""] = "rb"
   failure_cat[grepl("coefs don't match|coeffs don't match", cat, ignore.case = TRUE) & failure_cat == ""] = "coefs"

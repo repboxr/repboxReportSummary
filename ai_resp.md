@@ -1,70 +1,170 @@
-To address your request, we replace the previous "low priority" logic with a more robust "ignored articles" system. It behaves similarly by putting ignored articles at the bottom of the list, but now saves them out in both `.Rds` and `.yaml` formats alongside `xissues` and requires/stores a description for the ignored state.
+Here are the modifications to `repboxReportSummary` to properly show timeout problems in the main issues list.
 
-Here is an overview of the code modifications:
-1. **Added `ignored.R`**: A new R file containing functions for reading, appending, and deleting from the "ignored articles" list. Like `xissues`, it normalizes paths based on the report folder and tracks `artid` and `descr`.
-2. **Rewrote `sr_app`**: Replaced all `low_priority` usages in the Shiny App Server function.
-   - We swapped the standard priority buttons with "Ignore article" and "Un-ignore article".
-   - Clicking "Ignore article" displays a `modalDialog` asking the user for a reason (`descr`), which keeps the inline UI uncluttered.
-   - The DataTable sorting logic `arrange(is_ignored)` inherently puts ignored items at the bottom because `FALSE` is evaluated before `TRUE`.
+We will inject any detected `TIMEOUT` issues directly into the `sr_get_project_issues` output, prefixing the `issue_category` with `"TIMEOUT: "` and appending the timeout messages to the `problem` details column so they show up when the row is selected in the UI. We also adapt `xissues` so that you can categorize timeouts appropriately.
 
-!MODIFICATION ignored in R/ignored.R
-scope = "file"
-file = "/home/rstudio/repbox/repboxReportSummary/R/ignored.R"
-description = "Create functions for managing and persisting ignored articles."
+!MODIFICATION sr_get_project_issues repboxReportSummary/R/sr_data.R
+scope = "function"
+file = "/home/rstudio/repbox/repboxReportSummary/R/sr_data.R"
+function_name = "sr_get_project_issues"
+description = "Update `sr_get_project_issues` to detect timeout problems and prepend 'TIMEOUT: ' to issue_category, or create a new timeout row if no other issues exist."
 ---
 ```r
-ignored_default_file = function(output_dir = "~/repbox/reports") {
-  normalizePath(file.path(output_dir, "ignored_articles.Rds"), mustWork = FALSE)
-}
+#' Get and categorize issues for a single project based on fine-tuned categories
+sr_get_project_issues = function(project_dir, parcels=list()) {
+  restore.point("sr_get_project_issues")
+  library(repboxDB)
 
-ignored_text_file = function(output_dir = "~/repbox/reports") {
-  normalizePath(file.path(output_dir, "ignored_articles.yaml"), mustWork = FALSE)
-}
+  parcels = repdb_load_parcels(project_dir,c("regcheck", "reg"))
+  regcheck = parcels$regcheck
+  reg = parcels$reg
+  
+  df_rc = NULL
+  
+  if (!is.null(regcheck) && NROW(regcheck) > 0) {
+    df_rc = as.data.frame(regcheck)
+    if (!is.null(reg) && NROW(reg) > 0) {
+      df_rc = dplyr::left_join(df_rc, reg %>% dplyr::select(runid, cmd, cmdline), by="runid")
+    } else {
+      df_rc$cmd = NA_character_
+      df_rc$cmdline = NA_character_
+    }
+    df_rc = df_rc %>% dplyr::mutate(line=NA_integer_, file_path=NA_character_)
 
-ignored_load = function(file = ignored_default_file()) {
-  if (file.exists(file)) {
-    res = readRDS(file)
-    if (!is.null(res) && is.data.frame(res)) return(res)
+    # Check if run worked
+    reg_ok = sr_v_bool(df_rc$reg_ok, FALSE)
+
+    # Identify variables safely
+    so_exists = sr_v_bool(df_rc$so_raw_did_run, FALSE) | sr_v_bool(df_rc$so_did_run, FALSE)
+    sb_raw_exists = sr_v_bool(df_rc$sb_raw_did_run, FALSE)
+    sb_failed = !sr_v_bool(df_rc$sb_did_run, FALSE)
+    rb_failed = !sr_v_bool(df_rc$rb_did_run, FALSE)
+
+    sb_so_diff = !sr_v_bool(df_rc$sb_so_identical, TRUE)
+    share_same = sr_v_num(df_rc$rb_sb_share_coeff_same, 1)
+    coef_mismatch_share = 1 - share_same
+
+    cmd_col = tolower(as.character(df_rc$cmd))
+    cmd_col[is.na(cmd_col)] = ""
+    is_logit_probit = grepl("logit|probit", cmd_col)
+
+    cat = rep("8. Other issues", NROW(df_rc))
+
+    # 1. sb_raw, sb and rb failed but so exists
+    mask1 = !sb_raw_exists & sb_failed & rb_failed & so_exists
+    # 2. sb and rb failed but sb_raw exists
+    mask2 = sb_raw_exists & sb_failed & rb_failed
+    # 3. rb failed
+    mask3 = !mask1 & !mask2 & rb_failed
+    # 4. > 20% coeffs don't match between sb and rb and not a logit or probit command
+    mask4 = !rb_failed & (coef_mismatch_share > 0.2) & !is_logit_probit
+    # 5. sb and so coefs don't match
+    mask5 = !rb_failed & !mask4 & sb_so_diff
+    # 6. < 20% coeffs don't match (i.e. > 0 and <= 0.2)
+    mask6 = !rb_failed & !mask4 & !mask5 & (coef_mismatch_share > 0 & coef_mismatch_share <= 0.2) & !is_logit_probit
+    # 7. coefs don't match but logit or probit
+    mask7 = !rb_failed & (coef_mismatch_share > 0) & is_logit_probit
+
+    # Apply masks to category (later masks overwrite earlier ones if overlapping, though constructed to be mostly exclusive)
+    cat[mask7] = "7. Coefs don't match but logit/probit"
+    cat[mask6] = "6. < 20% coeffs don't match"
+    cat[mask5] = "5. sb and so coefs don't match"
+    cat[mask4] = "4. > 20% coeffs don't match (not logit/probit)"
+    cat[mask3] = "3. rb failed"
+    cat[mask2] = "2. sb and rb failed but sb_raw exists"
+    cat[mask1] = "1. sb_raw, sb and rb failed but so exists"
+
+    df_rc$issue_category = cat
+    
+    # Filter only actual issues
+    is_issue = !reg_ok | (cat != "8. Other issues") | (!is.na(df_rc$problem) & nzchar(as.character(df_rc$problem)))
+    df_rc = df_rc[is_issue, , drop = FALSE]
   }
-  data.frame(artid = character(), descr = character(), stringsAsFactors = FALSE)
-}
 
-ignored_save = function(df, file = ignored_default_file(), text_file = ignored_text_file()) {
-  saveRDS(df, file)
-  if (nrow(df) > 0) {
-    writeLines(yaml::as.yaml(df, column.major = FALSE), text_file)
-  } else {
-    writeLines("", text_file)
+  # Add Timeouts
+  probs = sr_get_project_problems(project_dir)
+  timeout_probs = data.frame()
+  if (!is.null(probs) && NROW(probs) > 0) {
+    timeout_probs = probs[probs$problem_type %in% c("stata_reproduction_timeout", "stata_reproduction_global_timeout", "mrb_stata_timeout"), , drop = FALSE]
   }
-}
-
-ignored_add = function(artid, descr = "", file = ignored_default_file(), text_file = ignored_text_file()) {
-  df = ignored_load(file)
-  idx = which(df$artid == artid)
-  if (length(idx) > 0) {
-    df$descr[idx[1]] = descr
-  } else {
-    df = rbind(df, data.frame(artid = as.character(artid), descr = as.character(descr), stringsAsFactors = FALSE))
+  
+  if (NROW(timeout_probs) > 0) {
+    timeout_msgs = paste0(timeout_probs$problem_descr, collapse = "\n\n")
+    
+    if (!is.null(df_rc) && NROW(df_rc) > 0) {
+      df_rc$issue_category = paste0("TIMEOUT: ", df_rc$issue_category)
+      if (!"problem" %in% names(df_rc)) df_rc$problem = ""
+      df_rc$problem = paste0(ifelse(is.na(df_rc$problem) | df_rc$problem == "", "", paste0(df_rc$problem, "\n\n")), "TIMEOUT DETAILS:\n", timeout_msgs)
+    } else {
+      df_rc = data.frame(
+        runid = NA_integer_,
+        cmd = "TIMEOUT",
+        cmdline = NA_character_,
+        issue_category = "TIMEOUT",
+        problem = paste0("TIMEOUT DETAILS:\n", timeout_msgs),
+        stringsAsFactors = FALSE
+      )
+    }
   }
-  ignored_save(df, file, text_file)
-  df
-}
 
-ignored_remove = function(artid, file = ignored_default_file(), text_file = ignored_text_file()) {
-  df = ignored_load(file)
-  df = df[df$artid != artid, , drop = FALSE]
-  ignored_save(df, file, text_file)
-  df
+  if (is.null(df_rc) || NROW(df_rc) == 0) return(NULL)
+
+  if (!"artid" %in% names(df_rc)) {
+    df_rc$artid = basename(project_dir)
+  }
+  df_rc$project_dir = project_dir
+
+  df_rc
 }
 ```
-!END_MODIFICATION ignored in R/ignored.R
+!END_MODIFICATION
 
 
-!MODIFICATION sr_app in R/sr_app.R
+!MODIFICATION xissue_failure_cats repboxReportSummary/R/xissues.R
+scope = "function"
+file = "/home/rstudio/repbox/repboxReportSummary/R/xissues.R"
+function_name = "xissue_failure_cats"
+description = "Add 'timeout' to xissue failure categories."
+---
+```r
+xissue_failure_cats = function() {
+  c("rb", "sb-rb", "sb_raw-sb-rb", "coefs","so", "timeout", "")
+}
+```
+!END_MODIFICATION
+
+
+!MODIFICATION sr_issue_to_failure_cat repboxReportSummary/R/sr_xissues.R
+scope = "function"
+file = "/home/rstudio/repbox/repboxReportSummary/R/sr_xissues.R"
+function_name = "sr_issue_to_failure_cat"
+description = "Handle 'TIMEOUT' in issue category."
+---
+```r
+# Map issue category strings consistently to short failure categories
+sr_issue_to_failure_cat = function(cat) {
+  restore.point("sr_issue_to_failure_cat")
+  if (is.null(cat) || length(cat) == 0) return(character(0))
+  cat[is.na(cat)] = ""
+
+  failure_cat = rep("", length(cat))
+  failure_cat[grepl("TIMEOUT", cat)] = "timeout"
+  failure_cat[grepl("sb_raw, sb and rb failed", cat) & failure_cat == ""] = "sb_raw-sb-rb"
+  failure_cat[grepl("sb and rb failed", cat) & failure_cat == ""] = "sb-rb"
+  failure_cat[grepl("rb failed", cat) & failure_cat == ""] = "rb"
+  failure_cat[grepl("coefs don't match|coeffs don't match", cat, ignore.case = TRUE) & failure_cat == ""] = "coefs"
+  failure_cat[grepl("sb and so coefs", cat) & failure_cat == ""] = "so"
+
+  failure_cat
+}
+```
+!END_MODIFICATION
+
+
+!MODIFICATION detail_table_rendering repboxReportSummary/R/sr_app.R
 scope = "function"
 file = "/home/rstudio/repbox/repboxReportSummary/R/sr_app.R"
 function_name = "sr_app"
-description = "Replace low priority implementation with the ignored articles logic, adding modal prompts for the description."
+description = "Update the detail table rendering in `sr_app` to properly match failure categories when prefixed with TIMEOUT."
 ---
 ```r
 #' Run the interactive Repbox Debugger Shiny App
@@ -240,7 +340,7 @@ sr_app = function(
         ) %>%
         dplyr::mutate(is_ignored = artid %in% ign_artids) %>%
         dplyr::arrange(
-          is_ignored,
+          is_ignored, # FALSE (not ignored) sorts before TRUE (ignored)
           nzchar(xid), # nzchar == FALSE (0) -> ordered first, matched ones later
           issue_category,
           dplyr::desc(n_issues)
@@ -268,8 +368,9 @@ sr_app = function(
     output$project_actions = shiny::renderUI({
       req(selected_issue_row())
       sel = selected_issue_row()
+      artid = sel$artid
 
-      is_ign = sel$artid %in% ignored_df()$artid
+      is_ign = artid %in% ignored_df()$artid
       btn_priority = if (is_ign) {
         shiny::actionButton("btn_unignore_article", "Un-ignore article", class = "btn-sm btn-info", style="margin-left:15px;")
       } else {
@@ -277,7 +378,10 @@ sr_app = function(
       }
 
       shiny::tagList(
-        shiny::div(style = "margin: 5px 0; padding-left: 4px; !important",
+        shiny::div(style = "margin-bottom: 5px; padding-left: 4px;",
+          shiny::strong(paste("Selected Article:", artid))
+        ),
+        shiny::div(style = "margin: 5px 0; padding-left: 4px;",
           shiny::actionButton("btn_study_and_close_issue", "Study and close", class = "btn-sm btn-default"),
           shiny::actionButton("btn_rstudio_issue", "Show in Files", icon = shiny::icon("folder-open"), class = "btn-sm btn-default"),
           shiny::actionButton("btn_report_issue", "do_report.html", icon = shiny::icon("file-code"), class = "btn-sm btn-default"),
@@ -288,8 +392,11 @@ sr_app = function(
 
     # Regcheck Ignore Modal logic
     shiny::observeEvent(input$btn_ignore_article_modal, {
+      req(selected_issue_row())
+      artid = selected_issue_row()$artid
+
       shiny::showModal(shiny::modalDialog(
-        title = "Ignore Article",
+        title = paste("Ignore Article:", artid),
         shiny::textInput("txt_ignore_descr", "Reason for ignoring (optional):", width = "100%"),
         footer = shiny::tagList(
           shiny::modalButton("Cancel"),
@@ -353,7 +460,9 @@ sr_app = function(
                     "2. sb and rb failed but sb_raw exists",
                     "3. rb failed")
 
-      if (sel$issue_category %in% fail_cats) {
+      is_fail_cat = any(sapply(fail_cats, function(x) grepl(x, sel$issue_category, fixed=TRUE)))
+
+      if (is_fail_cat || grepl("TIMEOUT", sel$issue_category, fixed=TRUE)) {
         pdir = sel$project_dir
         # Only load DRF safely
         drf = try(repboxDRF::drf_load(pdir, apply_caches = FALSE), silent = TRUE)
@@ -365,6 +474,7 @@ sr_app = function(
           err_runids = drf$r_err_runids
           for (i in seq_len(nrow(cur_issues))) {
             pid = cur_issues$runid[i]
+            if (is.na(pid)) next
             path = drf$path_df$runid[drf$path_df$pid == pid]
             bad_runids = intersect(path, err_runids)
             if (length(bad_runids) > 0) {
@@ -430,8 +540,9 @@ sr_app = function(
     output$prob_project_actions = shiny::renderUI({
       req(selected_prob_row())
       sel = selected_prob_row()
+      artid = sel$artid
 
-      is_ign = sel$artid %in% ignored_df()$artid
+      is_ign = artid %in% ignored_df()$artid
       btn_priority = if (is_ign) {
         shiny::actionButton("btn_unignore_article_prob", "Un-ignore article", class = "btn-sm btn-info", style="margin-left:15px;")
       } else {
@@ -439,6 +550,9 @@ sr_app = function(
       }
 
       shiny::tagList(
+        shiny::div(style = "margin-bottom: 5px;",
+          shiny::strong(paste("Selected Article:", artid))
+        ),
         shiny::div(style = "margin: 5px 0;",
           shiny::actionButton("btn_study_and_close", "Study and close", class = "btn-sm btn-default"),
           shiny::actionButton("btn_rstudio_prob", "Files", icon = shiny::icon("folder-open"), class = "btn-sm btn-default"),
@@ -450,8 +564,11 @@ sr_app = function(
 
     # Repbox Problems Ignore Modal logic
     shiny::observeEvent(input$btn_ignore_article_modal_prob, {
+      req(selected_prob_row())
+      artid = selected_prob_row()$artid
+
       shiny::showModal(shiny::modalDialog(
-        title = "Ignore Article",
+        title = paste("Ignore Article:", artid),
         shiny::textInput("txt_ignore_descr_prob", "Reason for ignoring (optional):", width = "100%"),
         footer = shiny::tagList(
           shiny::modalButton("Cancel"),
@@ -624,4 +741,4 @@ sr_app = function(
   shiny::shinyApp(ui, server)
 }
 ```
-!END_MODIFICATION sr_app in R/sr_app.R
+!END_MODIFICATION

@@ -45,65 +45,101 @@ sr_get_project_issues = function(project_dir, parcels=list()) {
   parcels = repdb_load_parcels(project_dir,c("regcheck", "reg"))
   regcheck = parcels$regcheck
   reg = parcels$reg
-  if (is.null(regcheck) || NROW(regcheck) == 0) return(NULL)
-  df_rc = as.data.frame(regcheck)
-  df_rc = left_join(df_rc, reg %>% select(runid, cmd, cmdline), by="runid") %>%
-    mutate(line=NA, file_path=NA)
 
-  # Check if run worked
-  reg_ok = sr_v_bool(df_rc$reg_ok, FALSE)
+  df_rc = NULL
 
-  # Identify variables safely
-  so_exists = sr_v_bool(df_rc$so_raw_did_run, FALSE) | sr_v_bool(df_rc$so_did_run, FALSE)
-  sb_raw_exists = sr_v_bool(df_rc$sb_raw_did_run, FALSE)
-  sb_failed = !sr_v_bool(df_rc$sb_did_run, FALSE)
-  rb_failed = !sr_v_bool(df_rc$rb_did_run, FALSE)
+  if (!is.null(regcheck) && NROW(regcheck) > 0) {
+    df_rc = as.data.frame(regcheck)
+    if (!is.null(reg) && NROW(reg) > 0) {
+      df_rc = dplyr::left_join(df_rc, reg %>% dplyr::select(runid, cmd, cmdline), by="runid")
+    } else {
+      df_rc$cmd = NA_character_
+      df_rc$cmdline = NA_character_
+    }
+    df_rc = df_rc %>% dplyr::mutate(line=NA_integer_, file_path=NA_character_)
 
-  sb_so_diff = !sr_v_bool(df_rc$sb_so_identical, TRUE)
-  share_same = sr_v_num(df_rc$rb_sb_share_coeff_same, 1)
-  coef_mismatch_share = 1 - share_same
+    # Check if run worked
+    reg_ok = sr_v_bool(df_rc$reg_ok, FALSE)
 
-  cmd_col = tolower(as.character(df_rc$cmd))
-  cmd_col[is.na(cmd_col)] = ""
-  is_logit_probit = grepl("logit|probit", cmd_col)
+    # Identify variables safely
+    so_exists = sr_v_bool(df_rc$so_raw_did_run, FALSE) | sr_v_bool(df_rc$so_did_run, FALSE)
+    sb_raw_exists = sr_v_bool(df_rc$sb_raw_did_run, FALSE)
+    sb_failed = !sr_v_bool(df_rc$sb_did_run, FALSE)
+    rb_failed = !sr_v_bool(df_rc$rb_did_run, FALSE)
 
-  cat = rep("8. Other issues", NROW(df_rc))
+    sb_so_diff = !sr_v_bool(df_rc$sb_so_identical, TRUE)
+    share_same = sr_v_num(df_rc$rb_sb_share_coeff_same, 1)
+    coef_mismatch_share = 1 - share_same
 
-  # 1. sb_raw, sb and rb failed but so exists
-  mask1 = !sb_raw_exists & sb_failed & rb_failed & so_exists
-  # 2. sb and rb failed but sb_raw exists
-  mask2 = sb_raw_exists & sb_failed & rb_failed
-  # 3. rb failed
-  mask3 = !mask1 & !mask2 & rb_failed
-  # 4. > 20% coeffs don't match between sb and rb and not a logit or probit command
-  mask4 = !rb_failed & (coef_mismatch_share > 0.2) & !is_logit_probit
-  # 5. sb and so coefs don't match
-  mask5 = !rb_failed & !mask4 & sb_so_diff
-  # 6. < 20% coeffs don't match (i.e. > 0 and <= 0.2)
-  mask6 = !rb_failed & !mask4 & !mask5 & (coef_mismatch_share > 0 & coef_mismatch_share <= 0.2) & !is_logit_probit
-  # 7. coefs don't match but logit or probit
-  mask7 = !rb_failed & (coef_mismatch_share > 0) & is_logit_probit
+    cmd_col = tolower(as.character(df_rc$cmd))
+    cmd_col[is.na(cmd_col)] = ""
+    is_logit_probit = grepl("logit|probit", cmd_col)
 
-  # Apply masks to category (later masks overwrite earlier ones if overlapping, though constructed to be mostly exclusive)
-  cat[mask7] = "7. Coefs don't match but logit/probit"
-  cat[mask6] = "6. < 20% coeffs don't match"
-  cat[mask5] = "5. sb and so coefs don't match"
-  cat[mask4] = "4. > 20% coeffs don't match (not logit/probit)"
-  cat[mask3] = "3. rb failed"
-  cat[mask2] = "2. sb and rb failed but sb_raw exists"
-  cat[mask1] = "1. sb_raw, sb and rb failed but so exists"
+    cat = rep("8. Other issues", NROW(df_rc))
 
-  df_rc$issue_category = cat
+    # 1. sb_raw, sb and rb failed but so exists
+    mask1 = !sb_raw_exists & sb_failed & rb_failed & so_exists
+    # 2. sb and rb failed but sb_raw exists
+    mask2 = sb_raw_exists & sb_failed & rb_failed
+    # 3. rb failed
+    mask3 = !mask1 & !mask2 & rb_failed
+    # 4. > 20% coeffs don't match between sb and rb and not a logit or probit command
+    mask4 = !rb_failed & (coef_mismatch_share > 0.2) & !is_logit_probit
+    # 5. sb and so coefs don't match
+    mask5 = !rb_failed & !mask4 & sb_so_diff
+    # 6. < 20% coeffs don't match (i.e. > 0 and <= 0.2)
+    mask6 = !rb_failed & !mask4 & !mask5 & (coef_mismatch_share > 0 & coef_mismatch_share <= 0.2) & !is_logit_probit
+    # 7. coefs don't match but logit or probit
+    mask7 = !rb_failed & (coef_mismatch_share > 0) & is_logit_probit
+
+    # Apply masks to category (later masks overwrite earlier ones if overlapping, though constructed to be mostly exclusive)
+    cat[mask7] = "7. Coefs don't match but logit/probit"
+    cat[mask6] = "6. < 20% coeffs don't match"
+    cat[mask5] = "5. sb and so coefs don't match"
+    cat[mask4] = "4. > 20% coeffs don't match (not logit/probit)"
+    cat[mask3] = "3. rb failed"
+    cat[mask2] = "2. sb and rb failed but sb_raw exists"
+    cat[mask1] = "1. sb_raw, sb and rb failed but so exists"
+
+    df_rc$issue_category = cat
+
+    # Filter only actual issues
+    is_issue = !reg_ok | (cat != "8. Other issues") | (!is.na(df_rc$problem) & nzchar(as.character(df_rc$problem)))
+    df_rc = df_rc[is_issue, , drop = FALSE]
+  }
+
+  # Add Timeouts
+  probs = sr_get_project_problems(project_dir)
+  timeout_probs = data.frame()
+  if (!is.null(probs) && NROW(probs) > 0) {
+    timeout_probs = probs[probs$problem_type %in% c("stata_reproduction_timeout", "stata_reproduction_global_timeout", "mrb_stata_timeout"), , drop = FALSE]
+  }
+
+  if (NROW(timeout_probs) > 0) {
+    timeout_msgs = paste0(timeout_probs$problem_descr, collapse = "\n\n")
+
+    if (!is.null(df_rc) && NROW(df_rc) > 0) {
+      df_rc$issue_category = paste0("TIMEOUT: ", df_rc$issue_category)
+      if (!"problem" %in% names(df_rc)) df_rc$problem = ""
+      df_rc$problem = paste0(ifelse(is.na(df_rc$problem) | df_rc$problem == "", "", paste0(df_rc$problem, "\n\n")), "TIMEOUT DETAILS:\n", timeout_msgs)
+    } else {
+      df_rc = data.frame(
+        runid = NA_integer_,
+        cmd = "TIMEOUT",
+        cmdline = NA_character_,
+        issue_category = "TIMEOUT",
+        problem = paste0("TIMEOUT DETAILS:\n", timeout_msgs),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  if (is.null(df_rc) || NROW(df_rc) == 0) return(NULL)
+
   if (!"artid" %in% names(df_rc)) {
     df_rc$artid = basename(project_dir)
   }
   df_rc$project_dir = project_dir
-
-  # Filter only actual issues
-  is_issue = !reg_ok | (cat != "8. Other issues") | (!is.na(df_rc$problem) & nzchar(as.character(df_rc$problem)))
-  df_rc = df_rc[is_issue, , drop = FALSE]
-
-  if (NROW(df_rc) == 0) return(NULL)
 
   df_rc
 }

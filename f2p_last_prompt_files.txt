@@ -1,4 +1,5 @@
 DESCRIPTION
+R/ignored.R
 R/shiny_app_job.R
 R/sr_addin.R
 R/sr_app.R

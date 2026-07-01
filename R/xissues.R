@@ -8,10 +8,8 @@ example = function() {
   xissue_add(xissue)
   rstudioapi::filesPaneNavigate(dirname(xissues_text_file()))
 }
-
-
 xissue_failure_cats = function() {
-  c("rb", "sb-rb", "sb_raw-sb-rb", "coefs","so", "")
+  c("rb", "sb-rb", "sb_raw-sb-rb", "coefs","so", "timeout", "")
 }
 
 
