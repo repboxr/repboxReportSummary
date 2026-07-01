@@ -1,12 +1,70 @@
-To implement the "low priority" feature, we will modify the main `sr_app` function in `R/sr_app.R`. We will add a new reactive value to track low-priority `artid`s, load them from `low_priority_issues_artid.txt`, update the summary tables to sort low-priority items at the bottom, and include the toggling buttons in both the Regcheck Issues and Repbox Problems tabs.
+To address your request, we replace the previous "low priority" logic with a more robust "ignored articles" system. It behaves similarly by putting ignored articles at the bottom of the list, but now saves them out in both `.Rds` and `.yaml` formats alongside `xissues` and requires/stores a description for the ignored state.
 
-Here is the modification for the `sr_app.R` file:
+Here is an overview of the code modifications:
+1. **Added `ignored.R`**: A new R file containing functions for reading, appending, and deleting from the "ignored articles" list. Like `xissues`, it normalizes paths based on the report folder and tracks `artid` and `descr`.
+2. **Rewrote `sr_app`**: Replaced all `low_priority` usages in the Shiny App Server function.
+   - We swapped the standard priority buttons with "Ignore article" and "Un-ignore article".
+   - Clicking "Ignore article" displays a `modalDialog` asking the user for a reason (`descr`), which keeps the inline UI uncluttered.
+   - The DataTable sorting logic `arrange(is_ignored)` inherently puts ignored items at the bottom because `FALSE` is evaluated before `TRUE`.
 
-!MODIFICATION sr_app in sr_app.R
+!MODIFICATION ignored in R/ignored.R
+scope = "file"
+file = "/home/rstudio/repbox/repboxReportSummary/R/ignored.R"
+description = "Create functions for managing and persisting ignored articles."
+---
+```r
+ignored_default_file = function(output_dir = "~/repbox/reports") {
+  normalizePath(file.path(output_dir, "ignored_articles.Rds"), mustWork = FALSE)
+}
+
+ignored_text_file = function(output_dir = "~/repbox/reports") {
+  normalizePath(file.path(output_dir, "ignored_articles.yaml"), mustWork = FALSE)
+}
+
+ignored_load = function(file = ignored_default_file()) {
+  if (file.exists(file)) {
+    res = readRDS(file)
+    if (!is.null(res) && is.data.frame(res)) return(res)
+  }
+  data.frame(artid = character(), descr = character(), stringsAsFactors = FALSE)
+}
+
+ignored_save = function(df, file = ignored_default_file(), text_file = ignored_text_file()) {
+  saveRDS(df, file)
+  if (nrow(df) > 0) {
+    writeLines(yaml::as.yaml(df, column.major = FALSE), text_file)
+  } else {
+    writeLines("", text_file)
+  }
+}
+
+ignored_add = function(artid, descr = "", file = ignored_default_file(), text_file = ignored_text_file()) {
+  df = ignored_load(file)
+  idx = which(df$artid == artid)
+  if (length(idx) > 0) {
+    df$descr[idx[1]] = descr
+  } else {
+    df = rbind(df, data.frame(artid = as.character(artid), descr = as.character(descr), stringsAsFactors = FALSE))
+  }
+  ignored_save(df, file, text_file)
+  df
+}
+
+ignored_remove = function(artid, file = ignored_default_file(), text_file = ignored_text_file()) {
+  df = ignored_load(file)
+  df = df[df$artid != artid, , drop = FALSE]
+  ignored_save(df, file, text_file)
+  df
+}
+```
+!END_MODIFICATION ignored in R/ignored.R
+
+
+!MODIFICATION sr_app in R/sr_app.R
 scope = "function"
 file = "/home/rstudio/repbox/repboxReportSummary/R/sr_app.R"
 function_name = "sr_app"
-description = "Add low priority article toggle, sorting, and persistence for Regcheck Issues and Repbox Problems."
+description = "Replace low priority implementation with the ignored articles logic, adding modal prompts for the description."
 ---
 ```r
 #' Run the interactive Repbox Debugger Shiny App
@@ -114,20 +172,17 @@ sr_app = function(
       }
     }
     load_xissues()
-    
-    # Load low priority artids
-    low_priority_file = file.path(output_dir, "low_priority_issues_artid.txt")
-    low_priority_artids = shiny::reactiveVal(character())
 
-    load_low_priority = function() {
-      if (file.exists(low_priority_file)) {
-        artids = try(readLines(low_priority_file, warn = FALSE), silent = TRUE)
-        if (!inherits(artids, "try-error")) {
-          low_priority_artids(artids[nzchar(artids)])
-        }
-      }
+    # Load ignored articles
+    ign_rds = ignored_default_file(output_dir)
+    ign_yaml = ignored_text_file(output_dir)
+    ignored_df = shiny::reactiveVal(data.frame())
+
+    load_ignored = function() {
+      df = ignored_load(ign_rds)
+      ignored_df(df)
     }
-    load_low_priority()
+    load_ignored()
 
     # Match static raw df_issues to currently active xissues
     issues_with_xid = shiny::reactive({
@@ -168,8 +223,8 @@ sr_app = function(
     summary_data = shiny::reactive({
       df = issues_with_xid()
       if (NROW(df) == 0) return(data.frame(Message = "No issues found"))
-      
-      low_artids = low_priority_artids()
+
+      ign_artids = ignored_df()$artid
 
       df %>%
         dplyr::group_by(issue_category, artid, project_dir, xid) %>%
@@ -183,9 +238,9 @@ sr_app = function(
           },
           .groups = "drop"
         ) %>%
-        dplyr::mutate(is_low_priority = artid %in% low_artids) %>%
+        dplyr::mutate(is_ignored = artid %in% ign_artids) %>%
         dplyr::arrange(
-          is_low_priority,
+          is_ignored,
           nzchar(xid), # nzchar == FALSE (0) -> ordered first, matched ones later
           issue_category,
           dplyr::desc(n_issues)
@@ -213,14 +268,14 @@ sr_app = function(
     output$project_actions = shiny::renderUI({
       req(selected_issue_row())
       sel = selected_issue_row()
-      
-      is_low = sel$artid %in% low_priority_artids()
-      btn_priority = if (is_low) {
-        shiny::actionButton("btn_set_normal_priority", "Set normal priority", class = "btn-sm btn-info", style="margin-left:15px;")
+
+      is_ign = sel$artid %in% ignored_df()$artid
+      btn_priority = if (is_ign) {
+        shiny::actionButton("btn_unignore_article", "Un-ignore article", class = "btn-sm btn-info", style="margin-left:15px;")
       } else {
-        shiny::actionButton("btn_set_low_priority", "Set low priority", class = "btn-sm btn-warning", style="margin-left:15px;")
+        shiny::actionButton("btn_ignore_article_modal", "Ignore article", class = "btn-sm btn-warning", style="margin-left:15px;")
       }
-      
+
       shiny::tagList(
         shiny::div(style = "margin: 5px 0; padding-left: 4px; !important",
           shiny::actionButton("btn_study_and_close_issue", "Study and close", class = "btn-sm btn-default"),
@@ -229,6 +284,34 @@ sr_app = function(
           btn_priority
         )
       )
+    })
+
+    # Regcheck Ignore Modal logic
+    shiny::observeEvent(input$btn_ignore_article_modal, {
+      shiny::showModal(shiny::modalDialog(
+        title = "Ignore Article",
+        shiny::textInput("txt_ignore_descr", "Reason for ignoring (optional):", width = "100%"),
+        footer = shiny::tagList(
+          shiny::modalButton("Cancel"),
+          shiny::actionButton("btn_confirm_ignore", "Ignore", class = "btn-warning")
+        )
+      ))
+    })
+
+    shiny::observeEvent(input$btn_confirm_ignore, {
+      req(selected_issue_row())
+      artid = selected_issue_row()$artid
+      descr = input$txt_ignore_descr
+      ignored_add(artid, descr, file = ign_rds, text_file = ign_yaml)
+      load_ignored()
+      shiny::removeModal()
+    })
+
+    shiny::observeEvent(input$btn_unignore_article, {
+      req(selected_issue_row())
+      artid = selected_issue_row()$artid
+      ignored_remove(artid, file = ign_rds, text_file = ign_yaml)
+      load_ignored()
     })
 
     shiny::observeEvent(input$btn_study_and_close_issue, {
@@ -251,30 +334,6 @@ sr_app = function(
         try(utils::browseURL(rep_file), silent = TRUE)
       } else {
         shiny::showNotification("do_report.html not found in project.", type = "warning")
-      }
-    })
-    
-    shiny::observeEvent(input$btn_set_low_priority, {
-      req(selected_issue_row())
-      artid = selected_issue_row()$artid
-      cur = low_priority_artids()
-      if (!(artid %in% cur)) {
-        new_list = c(cur, artid)
-        low_priority_artids(new_list)
-        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
-        writeLines(new_list, low_priority_file)
-      }
-    })
-
-    shiny::observeEvent(input$btn_set_normal_priority, {
-      req(selected_issue_row())
-      artid = selected_issue_row()$artid
-      cur = low_priority_artids()
-      if (artid %in% cur) {
-        new_list = setdiff(cur, artid)
-        low_priority_artids(new_list)
-        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
-        writeLines(new_list, low_priority_file)
       }
     })
 
@@ -337,8 +396,8 @@ sr_app = function(
     # --- Repbox Problems Logic ---
     prob_summary_data = shiny::reactive({
       if (NROW(df_probs) == 0) return(data.frame(Message = "No repbox_problems found"))
-      
-      low_artids = low_priority_artids()
+
+      ign_artids = ignored_df()$artid
 
       df_probs %>%
         dplyr::group_by(problem_type, artid, project_dir) %>%
@@ -346,8 +405,8 @@ sr_app = function(
           n_problems = dplyr::n(),
           .groups = "drop"
         ) %>%
-        dplyr::mutate(is_low_priority = artid %in% low_artids) %>%
-        dplyr::arrange(is_low_priority, dplyr::desc(n_problems))
+        dplyr::mutate(is_ignored = artid %in% ign_artids) %>%
+        dplyr::arrange(is_ignored, dplyr::desc(n_problems))
     })
 
     output$prob_summary_table = DT::renderDT({
@@ -371,14 +430,14 @@ sr_app = function(
     output$prob_project_actions = shiny::renderUI({
       req(selected_prob_row())
       sel = selected_prob_row()
-      
-      is_low = sel$artid %in% low_priority_artids()
-      btn_priority = if (is_low) {
-        shiny::actionButton("btn_set_normal_priority_prob", "Set normal priority", class = "btn-sm btn-info", style="margin-left:15px;")
+
+      is_ign = sel$artid %in% ignored_df()$artid
+      btn_priority = if (is_ign) {
+        shiny::actionButton("btn_unignore_article_prob", "Un-ignore article", class = "btn-sm btn-info", style="margin-left:15px;")
       } else {
-        shiny::actionButton("btn_set_low_priority_prob", "Set low priority", class = "btn-sm btn-warning", style="margin-left:15px;")
+        shiny::actionButton("btn_ignore_article_modal_prob", "Ignore article", class = "btn-sm btn-warning", style="margin-left:15px;")
       }
-      
+
       shiny::tagList(
         shiny::div(style = "margin: 5px 0;",
           shiny::actionButton("btn_study_and_close", "Study and close", class = "btn-sm btn-default"),
@@ -388,29 +447,33 @@ sr_app = function(
         )
       )
     })
-    
-    shiny::observeEvent(input$btn_set_low_priority_prob, {
-      req(selected_prob_row())
-      artid = selected_prob_row()$artid
-      cur = low_priority_artids()
-      if (!(artid %in% cur)) {
-        new_list = c(cur, artid)
-        low_priority_artids(new_list)
-        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
-        writeLines(new_list, low_priority_file)
-      }
+
+    # Repbox Problems Ignore Modal logic
+    shiny::observeEvent(input$btn_ignore_article_modal_prob, {
+      shiny::showModal(shiny::modalDialog(
+        title = "Ignore Article",
+        shiny::textInput("txt_ignore_descr_prob", "Reason for ignoring (optional):", width = "100%"),
+        footer = shiny::tagList(
+          shiny::modalButton("Cancel"),
+          shiny::actionButton("btn_confirm_ignore_prob", "Ignore", class = "btn-warning")
+        )
+      ))
     })
 
-    shiny::observeEvent(input$btn_set_normal_priority_prob, {
+    shiny::observeEvent(input$btn_confirm_ignore_prob, {
       req(selected_prob_row())
       artid = selected_prob_row()$artid
-      cur = low_priority_artids()
-      if (artid %in% cur) {
-        new_list = setdiff(cur, artid)
-        low_priority_artids(new_list)
-        dir.create(dirname(low_priority_file), recursive = TRUE, showWarnings = FALSE)
-        writeLines(new_list, low_priority_file)
-      }
+      descr = input$txt_ignore_descr_prob
+      ignored_add(artid, descr, file = ign_rds, text_file = ign_yaml)
+      load_ignored()
+      shiny::removeModal()
+    })
+
+    shiny::observeEvent(input$btn_unignore_article_prob, {
+      req(selected_prob_row())
+      artid = selected_prob_row()$artid
+      ignored_remove(artid, file = ign_rds, text_file = ign_yaml)
+      load_ignored()
     })
 
     shiny::observeEvent(input$btn_study_and_close, {
@@ -561,4 +624,4 @@ sr_app = function(
   shiny::shinyApp(ui, server)
 }
 ```
-!END_MODIFICATION sr_app in sr_app.R
+!END_MODIFICATION sr_app in R/sr_app.R
